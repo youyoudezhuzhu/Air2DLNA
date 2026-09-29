@@ -66,7 +66,7 @@ appcenter-cli start air2dlna
 
 | 能力 | 说明 |
 |---|---|
-| 真正的 AirPlay 2 接收 | 基于 shairport-sync 5.5.1（`--with-airplay-2`）+ NQPTP 1.2.8；注册 `_airplay._tcp`（含 HomeKit 配对公钥 `pk` 与 `features` 能力位）与兼容用的 `_raop._tcp` |
+| 真正的 AirPlay 2 接收 | 基于 shairport-sync 5.5.1（`--with-airplay-2`）+ NQPTP 1.2.8；注册 `_airplay._tcp`（含 HomeKit 配对公钥 `pk` 与 `features` 能力位）与兼容用的 `_raop._tcp`；mDNS 设备类别按**音频接收设备**广播，iOS 设备列表显示为音响/扬声器 |
 | 音频格式 | 输入支持 ALAC 与 AAC（内置解码 + 静态链接的 FFmpeg AAC 解码器）；5.1/7.1 自动混音为立体声；44.1k/48k 自动重采样 |
 | 实时桥接 | **不落盘**：PCM 经内存环形缓冲由 DLNA 渲染器通过 HTTP 边产生边拉取 |
 | DLNA 发现 | SSDP + 设备描述解析（friendlyName / UDN / model / manufacturer / 服务端点） |
@@ -74,7 +74,8 @@ appcenter-cli start air2dlna
 | 播放控制 | Play / Pause / Stop / Seek（重锚）/ 音量；统一内部 `PlaybackState`，不逐条直译 SOAP |
 | 进度同步 | 使用 shairport-sync 的 `prgr` / `phbt` 时间戳 + 单调时钟建立 `AudioTimeline`；GENA 事件优先，轮询兜底 |
 | 状态展示 | 播放状态、标题/艺术家/专辑/封面、当前位置与总时长、音量、日志 |
-| 异常恢复 | 渲染器掉线标记离线（不自动切换设备）、进程崩溃自动重启、AirPlay 重连重建会话；渲染器固有延迟（音箱缓冲/淡入）自动补偿而不重建会话；渲染器停止拉流时自动重建会话 |
+| 播放稳定性 | **AirPlay 时间线是唯一权威时间线**：DLNA 的 `RelTime`、`GetPositionInfo`、内部缓冲延迟、HTTP `Range`、HTTP 重连都只是观测信息，绝不据此更换媒体生命周期。固定的位置偏差是渲染器缓冲延迟，不再触发换代重建（那会让音箱重新淡入 → 周期性声音变小又变大）。只有三种原因允许换代：真实 seek（`pfls`/`pdis`）、渲染器链路真的断了、播放真的结束 |
+| 异常恢复 | 渲染器掉线标记离线（不自动切换设备）、进程崩溃自动重启；`pend` 视为**播放流结束**并进入短过渡态（不立即 Stop/不 flush/不清 session），窗口内没有新流才真正结束 → 拖动进度条后不再长时间无声；渲染器声称在播放却长时间无人拉流时兜底重建 |
 
 ---
 
@@ -108,7 +109,7 @@ airplay2-dlna-bridge/
 ```bash
 ./scripts/build.sh              # 全量构建（约 5–10 分钟）
 ./scripts/build.sh --skip-native  # 只重新打包
-# 产物：dist/Air2DLNA-1.0.4.fpk
+# 产物：dist/Air2DLNA-1.0.5.fpk
 ```
 
 脚本会：安装构建依赖 → 下载并**解包**（不安装）Avahi 开发文件 → 构建最小化静态
@@ -161,6 +162,21 @@ Play → WAV 头与 PCM 内容校验 → 音量映射 → 暂停/恢复 → Seek
 - `nqptp.log`：由看护脚本每 60 秒检查
 
 升级**不会**删除配置；卸载时可在向导里选择保留或删除。
+
+### 诊断日志（1.0.5）
+
+排查播放问题时优先看这几行（Web UI 的日志页或 `bridge.log`）：
+
+| 日志 | 含义 |
+|---|---|
+| `SetAVTransportURI #N reason=... generation=...` | 第 N 次更换媒体资源及原因。**一次正常播放应当只有 1 次**（`reason=pbeg`），多于 1 次才说明有异常重建 |
+| `检测到 seek/flush (...) 换代并重锚 DLNA 会话` | 真实 seek（`pfls`/`pdis`）：允许且预期一次换代 |
+| `AirPlay 播放流结束（...）：进入过渡态` | 收到 `pend`。DLNA 侧保持不动等待新的流，不再立即停止 |
+| `过渡态结束（...）：继续沿用当前 DLNA 会话` | 新流在窗口内到达 → 播放继续（拖动进度条后的正常路径） |
+| `过渡态超时（...），按播放结束处理` | 窗口内确实没有新流，才真正停止 |
+| `渲染器 Ns 未拉取音频流（...），重建 DLNA 会话` | 渲染器链路真的断了 → 兜底重建 |
+| `诊断: airplay_pos=... rel_time=... offset=... rate=... gen=... http_clients=... uri_count=...` | 每 15 秒一条。`offset` 是渲染器位置与 AirPlay 时间线的偏差，**稳定的数千毫秒属于正常缓冲延迟**；`rate` 明显偏离 1.0 才可能是真时钟漂移 |
+| `渲染器时钟速率偏离（ΔRelTime/ΔAirPlay=...）：仅记录诊断，不重建会话` | 真漂移的诊断记录（1.0.5 起不再自动重建） |
 
 ### 常用排查
 
