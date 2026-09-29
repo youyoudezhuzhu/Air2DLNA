@@ -116,14 +116,18 @@ class BridgeController:
     #: 但领先过多说明位置本身不可信（或数据早已被覆盖），此时不该启用方案 A。
     PAUSE_RECOVERY_LEAD_ALLOWANCE_SECONDS = 1.0
     #: 方案 A 启动后，若渲染器在这段时间内没有发起任何新的 HTTP 连接，
-    #: 说明这台固件不会自己重连 —— 提前 fallback，别让用户干等到总超时。
-    PAUSE_RECOVERY_RECONNECT_GRACE_SECONDS = 3.0
+    #: 说明这台固件不会自己重连 —— 立刻 fallback。
+    #: 取 1 秒：会自行重连的固件在恢复播放后通常几十毫秒内就发起连接。
+    PAUSE_RECOVERY_RECONNECT_GRACE_SECONDS = 1.0
     #: 「暂停恢复」（方案 A）等待渲染器自己重连 HTTP 的窗口（秒）。
     #: 真机实测小爱音箱把 UPnP Pause 执行成 Stop，Stop 后只发 Play 会"假播放"
     #: （报告 PLAYING、继续拉流、但无声），必须靠它自己重新 GET（Range: bytes=0-）
     #: 重新建立音频管线。窗口内把「逻辑 0 点」映射到暂停位置即可有声且不掉位置；
     #: 窗口内没等到就 fallback 换代重建，避免卡死。
-    PAUSE_RECOVERY_TIMEOUT_SECONDS = 8.0
+    PAUSE_RECOVERY_TIMEOUT_SECONDS = 5.0
+    #: 恢复窗口内的快速轮询间隔（秒）。这段时间只做纯本地状态判定，
+    #: 不发任何 SOAP，所以可以远快于常规轮询 —— 用户点恢复后要尽快出结论。
+    PAUSE_RECOVERY_POLL_INTERVAL_SECONDS = 0.2
     #: 判定「渲染器时钟速率异常」的相对偏差容差（ΔRelTime / ΔAirPlay）。
     #: 采样粒度是 1 秒，正常读数本就有 ±0.3 量级抖动，容差太小会被噪声淹没。
     RELTIME_RATE_TOLERANCE = 0.20
@@ -193,6 +197,9 @@ class BridgeController:
         #: 方案 A 启动时的 HTTP 连接计数基线（用于判断渲染器是否真的重连了）
         self._recovery_range_baseline = 0
         self._recovery_started_at = 0.0
+        #: 渲染器是否表现出「Stop 后会自己重连 HTTP」的能力。
+        #: None = 未知（首次给一个短窗口验证）；False = 已确认不重连 → 下次直接 fallback。
+        self._renderer_reconnect_capable: Optional[bool] = None
         #: 最近一次因真实 seek 换代的时刻
         self._handled_seek_at = 0.0
         self._last_range_info = ""
@@ -520,19 +527,28 @@ class BridgeController:
             with self._lock:
                 self._pause_recovery_deadline = 0.0
                 self._pause_recovery_pending = False
+            self._renderer_reconnect_capable = True
             log.info("暂停恢复: 成功 —— 渲染器已使用 Range 0 映射并在拉流，"
-                     "位置即暂停位置，未换代、未换 URI")
+                     "位置即暂停位置，未换代、未换 URI（耗时 %.1fs）",
+                     time.monotonic() - self._recovery_started_at)
             return
         now = time.monotonic()
         # 渲染器若会自己重连，通常在恢复播放后立刻发起。宽限期内一次新连接都没有，
         # 就说明这台固件不重连 —— 提前 fallback，避免用户白等整个超时窗口。
+        grace = self._recovery_grace_seconds()
         if (session is not None and not session.recovery_applied
                 and session.range_requests <= self._recovery_range_baseline
-                and now - self._recovery_started_at >= self.PAUSE_RECOVERY_RECONNECT_GRACE_SECONDS):
+                and now - self._recovery_started_at >= grace):
             self._pause_fallback_reason = "渲染器未重连（固件不自行重建 HTTP）"
-            log.info("暂停恢复: %.1fs 内渲染器没有发起新的 HTTP 连接（%s），"
-                     "判定这台固件不重连，提前 fallback",
-                     now - self._recovery_started_at, self._pause_fallback_reason)
+            if self._renderer_reconnect_capable is None:
+                # 记录结论：下次恢复不再白等
+                self._renderer_reconnect_capable = False
+                log.info("暂停恢复: 确认该渲染器不会自行重连 HTTP，"
+                         "后续恢复将直接 fallback（不再等待）")
+            log.info("暂停恢复: 宽限期 %.1fs 内渲染器没有发起新的 HTTP 连接（%s），"
+                     "fallback 换代重建，耗时 %.1fs",
+                     grace, self._pause_fallback_reason,
+                     now - self._recovery_started_at)
             with self._lock:
                 self._pause_recovery_deadline = 0.0
                 self._pause_recovery_pending = False
@@ -1057,10 +1073,36 @@ class BridgeController:
                 self._log_diagnostics()
             except Exception:  # noqa: BLE001
                 log.exception("位置轮询异常")
+            # 恢复窗口期间改用 0.2 秒级的纯本地判定：把「用户点恢复 → 出结论」
+            # 的等待压到最短（常规轮询间隔是 3 秒级，会把恢复拖长好几秒）。
+            if self._pause_recovery_deadline > 0.0:
+                self._wait_recovery_window()
+                continue
             # 加 ±20% 抖动，避免与设备自身的定时任务共振
             import random
 
             self._stop_event.wait(interval * random.uniform(0.8, 1.2))
+
+    def _wait_recovery_window(self) -> None:
+        """恢复窗口内的快速本地轮询（只做状态判定，不发 SOAP）。"""
+        steps = int(self.PAUSE_RECOVERY_TIMEOUT_SECONDS
+                    / self.PAUSE_RECOVERY_POLL_INTERVAL_SECONDS) + 5
+        for _ in range(steps):
+            if self._stop_event.wait(self.PAUSE_RECOVERY_POLL_INTERVAL_SECONDS):
+                return
+            try:
+                self._check_pause_recovery()
+            except Exception:  # noqa: BLE001
+                log.exception("暂停恢复判定异常")
+                return
+            if self._pause_recovery_deadline <= 0.0:
+                return
+
+    def _recovery_grace_seconds(self) -> float:
+        """等待渲染器自己重连的宽限期；已确认不重连的固件直接 0 等待。"""
+        if self._renderer_reconnect_capable is False:
+            return 0.0
+        return self.PAUSE_RECOVERY_RECONNECT_GRACE_SECONDS
 
     def _renew_subscriptions_if_due(self) -> None:
         """GENA 订阅按 1800s 周期续订（到期前 600s 续订一次）。"""

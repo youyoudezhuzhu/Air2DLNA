@@ -572,6 +572,48 @@ class PauseRecoveryTests(unittest.TestCase):
         self.assertEqual(generation_before, ring.generation,
                          "方案 A 期间不得触发兜底重建（会打断恢复）")
 
+    def test_fallback_records_renderer_cannot_reconnect(self) -> None:
+        """确认渲染器不自行重连后，后续恢复不再白等（grace 归零）。"""
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller._pause_recovery_pending = True
+        self.assertIsNone(controller._renderer_reconnect_capable, "初始应为未知")
+
+        controller._handle_play(True)                  # 启动方案 A
+        session = streams.get(controller._gen_token)
+        session.range_requests = controller._recovery_range_baseline   # 没有新连接
+        controller._recovery_started_at = time.monotonic() - 5.0       # 已超过宽限期
+        session.recovery_applied = False
+
+        controller._check_pause_recovery()
+
+        self.assertFalse(controller._renderer_reconnect_capable,
+                         "应记录该渲染器不会自行重连")
+        self.assertEqual(0.0, controller._recovery_grace_seconds(),
+                         "后续恢复不应再等待")
+        self.assertEqual("pause-recovery-unavailable", controller._last_rebuild_reason)
+
+    def test_recovery_success_marks_renderer_capable(self) -> None:
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller._pause_recovery_pending = True
+        controller._handle_play(True)
+        session = streams.get(controller._gen_token)
+        session.recovery_applied = True
+        session.clients = 1
+
+        controller._check_pause_recovery()
+
+        self.assertTrue(controller._renderer_reconnect_capable)
+
     def test_seek_clears_pause_recovery(self) -> None:
         controller, _, ring, timeline, _, _ = _build()
         controller._handle_play(False)
