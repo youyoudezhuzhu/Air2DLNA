@@ -37,7 +37,7 @@ iPhone / iPad / Mac
 
 ```bash
 # 在飞牛 NAS 上（应用中心也可直接手动安装 .fpk）
-appcenter-cli install-fpk Air2DLNA-1.0.2.fpk --volume 1
+appcenter-cli install-fpk Air2DLNA-1.0.3.fpk --volume 1
 appcenter-cli start air2dlna
 ```
 
@@ -74,7 +74,7 @@ appcenter-cli start air2dlna
 | 播放控制 | Play / Pause / Stop / Seek（重锚）/ 音量；统一内部 `PlaybackState`，不逐条直译 SOAP |
 | 进度同步 | 使用 shairport-sync 的 `prgr` / `phbt` 时间戳 + 单调时钟建立 `AudioTimeline`；GENA 事件优先，轮询兜底 |
 | 状态展示 | 播放状态、标题/艺术家/专辑/封面、当前位置与总时长、音量、日志 |
-| 异常恢复 | 渲染器掉线标记离线（不自动切换设备）、进程崩溃自动重启、AirPlay 重连重建会话 |
+| 异常恢复 | 渲染器掉线标记离线（不自动切换设备）、进程崩溃自动重启、AirPlay 重连重建会话；渲染器固有延迟（音箱缓冲/淡入）自动补偿而不重建会话；渲染器停止拉流时自动重建会话 |
 
 ---
 
@@ -108,7 +108,7 @@ airplay2-dlna-bridge/
 ```bash
 ./scripts/build.sh              # 全量构建（约 5–10 分钟）
 ./scripts/build.sh --skip-native  # 只重新打包
-# 产物：dist/Air2DLNA-1.0.2.fpk
+# 产物：dist/Air2DLNA-1.0.3.fpk
 ```
 
 脚本会：安装构建依赖 → 下载并**解包**（不安装）Avahi 开发文件 → 构建最小化静态

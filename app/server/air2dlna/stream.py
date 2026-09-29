@@ -155,6 +155,7 @@ class StreamSession:
     bits: int = 16
     duration_ms: Optional[float] = None
     created_at: float = field(default_factory=time.monotonic)
+    last_activity: float = 0.0        # 最近一次成功向客户端写出数据的时刻
     total_bytes: Optional[int] = None     # 声明给渲染器的 data 长度（WAV）
     bytes_served: int = 0
     clients: int = 0
@@ -327,6 +328,7 @@ class StreamManager:
                         data = data[:remaining]
                 wfile.write(data)
                 session.bytes_served += len(data)
+                session.last_activity = time.monotonic()
 
             # 声明了总长度但实际数据不足：补静音，避免渲染器等到超时
             if (session.total_bytes is not None

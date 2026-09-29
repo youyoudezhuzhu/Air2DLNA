@@ -118,6 +118,12 @@ class AudioTimeline:
         with self._lock:
             self._renderer_latency_ms = float(latency_ms)
 
+    @property
+    def renderer_latency_ms(self) -> float:
+        """当前生效的渲染器延迟补偿（毫秒）。"""
+        with self._lock:
+            return self._renderer_latency_ms
+
     def set_metadata_duration_ms(self, duration_ms: Optional[float]) -> None:
         with self._lock:
             self._metadata_duration_ms = duration_ms

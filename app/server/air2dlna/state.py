@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -94,12 +95,24 @@ class _Intent:
 class BridgeController:
     """把 AirPlay 事件、PCM 缓冲、DLNA 渲染器粘合在一起。"""
 
-    #: 会话建立后的漂移宽限期（秒）：渲染器此时仍在缓冲，位置值不可比
-    DRIFT_GRACE_SECONDS = 8.0
+    #: 会话建立后的漂移宽限期（秒）：渲染器此时仍在缓冲，位置值不可比。
+    #: 取得比音箱缓冲建立时间略长，避免一上来就误判。
+    DRIFT_GRACE_SECONDS = 12.0
     #: 两次漂移重建之间的最小间隔（秒），避免抖动造成反复切断播放
     DRIFT_REBUILD_COOLDOWN_SECONDS = 10.0
     #: 单个播放会话内允许的漂移重建次数上限，超过则停止自动重建
     DRIFT_REBUILD_LIMIT = 5
+    #: 判定「渲染器固定延迟」用的样本数与相邻样本允许的变化量。
+    #: 音箱自身的内部缓冲/淡入表现为一个**不再增长的**恒定偏差（真机实测约 3~4 秒，
+    #: 相邻采样间会小幅抖动）；真正的漂移则每个采样都在明显增长。
+    #: 只有后者才值得重建会话 —— 重建会让音箱重新淡入（听感是声音突然变小又变大）。
+    #: 用「相邻变化幅度」而不是「极差」判定，是为了容忍音箱缓冲的抖动。
+    DRIFT_STABLE_SAMPLES = 3
+    DRIFT_STABLE_STEP_MS = 700.0
+    #: 自动延迟补偿的上限（需落在配置项 av_offset_ms 的合法区间 ±10000 内）
+    MAX_AUTO_LATENCY_MS = 9000.0
+    #: 渲染器「声称在播放但没有拉流」多久后触发兜底重建（秒）
+    STREAM_STALL_SECONDS = 6.0
 
     def __init__(self, config, registry, ring: PcmRingBuffer, timeline: AudioTimeline,
                  streams: stream.StreamManager, log=None) -> None:
@@ -132,6 +145,10 @@ class BridgeController:
         self._last_drift_rebuild = 0.0
         self._drift_rebuilds = 0
         self._drift_limit_logged = False
+        #: 最近的漂移样本，用于区分「固定延迟」与「真实漂移」
+        self._drift_history: deque[float] = deque(maxlen=self.DRIFT_STABLE_SAMPLES)
+        #: 上次因「渲染器没在拉流」而重建的时刻
+        self._last_stall_rebuild = 0.0
         #: 上一轮收敛失败需要重试（由 _safe_call 置位）
         self._converge_dirty = False
         self._last_volume_tx = 0.0
@@ -292,6 +309,7 @@ class BridgeController:
         self._drift_rebuilds = 0
         self._drift_limit_logged = False
         self._last_drift_rebuild = 0.0
+        self._drift_history.clear()
         self._begin_new_generation(reason="pbeg", offset_ms=None)
         self._start_dlna_session(reason="pbeg")
 
@@ -333,6 +351,7 @@ class BridgeController:
         self._drift_limit_logged = False
         self._last_drift_rebuild = 0.0
         self._session_started_at = 0.0
+        self._drift_history.clear()
         self.streams.close_all()
         self._set_intent(_MODE_STOP, "")
 
@@ -707,7 +726,33 @@ class BridgeController:
                     self.state.duration_ms = duration
                 self._check_drift(record)
 
+        self._check_renderer_stream()
+
         self._sync_positions()
+
+    def _check_renderer_stream(self) -> None:
+        """兜底：渲染器声称在播放，却长时间没有拉取音频流。
+
+        典型场景是 iPhone 拖动进度条（或暂停再恢复）后渲染器不再重连 ——
+        听感就是「拖动之后声音直接停了」。这种故障用 SOAP 轮询看不出来
+        （GetTransportInfo 仍回报 PLAYING），只能自己检查有没有客户端在拉流，
+        随后重建会话把它拉回来。
+        """
+        if self.state.state != PLAYING or not self._renderer_token:
+            return
+        session = self.streams.get(self._renderer_token)
+        if session is None or session.closed or session.clients > 0:
+            return
+        idle = time.monotonic() - (session.last_activity or session.created_at)
+        if idle <= self.STREAM_STALL_SECONDS:
+            return
+        now = time.monotonic()
+        if now - self._last_stall_rebuild <= self.DRIFT_REBUILD_COOLDOWN_SECONDS:
+            return
+        self._last_stall_rebuild = now
+        log.warning("渲染器 %.0fs 未拉取音频流（seek/恢复后未重连），重建 DLNA 会话", idle)
+        self._begin_new_generation(reason="stalled", offset_ms=None)
+        self._start_dlna_session(reason="stalled")
 
     def _check_drift(self, record) -> None:
         drift = self.timeline.drift_ms()
@@ -719,7 +764,26 @@ class BridgeController:
             return
         threshold = float(self.config.get("drift_threshold_ms"))
         if abs(drift) <= threshold:
+            self._drift_history.clear()
             return
+
+        # —— 区分「渲染器固定延迟」与「真实漂移」 ——
+        # 音箱内部缓冲 / 淡入会带来一个**稳定的**恒定偏差（真机实测小爱音箱约 3~4 秒）。
+        # 重建会话会让音箱重新淡入（听感：播放一小段，声音突然变小又变大），所以固定
+        # 偏差应当补偿掉而不是重建；只有持续变化（越走越远）的漂移才值得重建。
+        self._drift_history.append(drift)
+        if len(self._drift_history) < self.DRIFT_STABLE_SAMPLES:
+            log.debug("漂移 %.0f ms，样本不足（%d/%d），先观察不重建",
+                      drift, len(self._drift_history), self.DRIFT_STABLE_SAMPLES)
+            return
+        history = list(self._drift_history)
+        steps = [abs(history[i] - history[i - 1]) for i in range(1, len(history))]
+        if steps and all(step <= self.DRIFT_STABLE_STEP_MS for step in steps):
+            average = sum(history) / len(history)
+            if self._absorb_latency(average, record):
+                self._drift_history.clear()
+                return
+
         if self._drift_rebuilds >= self.DRIFT_REBUILD_LIMIT:
             if not self._drift_limit_logged:
                 self._drift_limit_logged = True
@@ -747,6 +811,35 @@ class BridgeController:
         #    重建一次，形成死循环。
         self._begin_new_generation(reason="drift", offset_ms=None)
         self._start_dlna_session(reason="drift")
+
+    def _absorb_latency(self, drift_ms: float, record) -> bool:
+        """把稳定的漂移当渲染器固定延迟补偿掉。
+
+        返回 True 表示已吸收（调用方不应再重建会话）。重建会让音箱重新淡入，
+        这正是「播放一小段声音就变小再变大」的来源，所以能用补偿解决的绝不重建。
+        """
+        current = self.timeline.renderer_latency_ms
+        target = current + drift_ms
+        if abs(target) > self.MAX_AUTO_LATENCY_MS:
+            # 注意：这里**不能**清空样本历史 —— 清了就永远攒不够判定所需的样本数，
+            # 真正的漂移反而再也触发不了重建。保持原样让流程继续走到重建分支。
+            log.warning(
+                "固定偏差 %.0f ms 补偿后为 %.0f ms，超出上限 %.0f ms，按真实漂移处理",
+                drift_ms, target, self.MAX_AUTO_LATENCY_MS,
+            )
+            return False
+        self.timeline.set_renderer_latency_ms(target)
+        log.info(
+            "渲染器 %s 存在 %.0f ms 固定播放延迟（音箱内部缓冲/淡入），已自动补偿为 "
+            "%.0f ms：不再重建会话，避免反复淡入",
+            record.name, drift_ms, target,
+        )
+        # 顺手写回配置，下次播放无需重新学习（写不成也不影响本次播放）
+        try:
+            self.config.update({"av_offset_ms": int(round(target))})
+        except Exception:  # noqa: BLE001
+            log.debug("延迟补偿写回配置失败，不影响本次播放", exc_info=True)
+        return True
 
     def _sync_positions(self) -> None:
         position = self.timeline.position_ms()

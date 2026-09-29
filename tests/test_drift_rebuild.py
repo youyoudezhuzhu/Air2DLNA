@@ -161,7 +161,9 @@ class DriftRebuildTests(unittest.TestCase):
         controller._session_started_at = time.monotonic() - 60  # 已过宽限期
         generation_before = ring.generation
 
-        controller._check_drift(record)
+        # 现在需要连续 DRIFT_STABLE_SAMPLES 个样本才下结论（先排除"固定延迟"的可能性）
+        for _ in range(controller.DRIFT_STABLE_SAMPLES):
+            controller._check_drift(record)
 
         self.assertEqual(1, controller._drift_rebuilds, "应触发一次重建")
         self.assertGreater(ring.generation, generation_before, "必须换代（flush 缓冲）")
