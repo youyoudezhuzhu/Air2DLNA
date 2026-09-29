@@ -37,13 +37,19 @@ appcenter-cli start airplay2dlna
 
 ### 首次使用
 
-1. 打开应用（Web UI 默认在 `http://<NAS_IP>:8788`）。
+1. 打开应用：**应用中心 / 桌面点击本应用图标**（走飞牛统一网关）；也可直接在浏览器
+   访问 `http://<NAS_IP>:8788`。
 2. 在「AirPlay 音箱名称」里填一个名字（默认 `Feiniu AirPlay`），保存。
    这个名字会出现在 iPhone 的 AirPlay 列表里。
 3. 点「搜索设备」，在「DLNA 播放设备」里选择你的音响。
 4. 在 iPhone 控制中心 → AirPlay → 选择上面那个名字，即可播放。
 
 之后日常使用完全不需要再打开 NAS。
+
+> 桌面入口说明（1.0.1 修复）：应用中心/桌面图标通过飞牛统一网关（`gatewaySocket` +
+> `gatewayPrefix`，见 `app/ui/config`）访问应用，服务端监听 `target/airplay2dlna.sock`
+> 并剥离 `/app/airplay2dlna` 前缀。此前使用 `{port}` / `{display_name}` 这类飞牛并不
+> 支持的占位符（飞牛只支持 `${...}` 形式），导致入口打开后是空白页。
 
 ---
 

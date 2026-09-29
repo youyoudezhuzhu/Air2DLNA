@@ -17,6 +17,7 @@ import logging
 import mimetypes
 import os
 import posixpath
+import socket
 import threading
 import urllib.parse
 from http import HTTPStatus
@@ -36,7 +37,8 @@ class AppContext:
     """HTTP 层需要的全部依赖，避免全局变量。"""
 
     def __init__(self, config, registry, controller, streams, log_path: str,
-                 version: str, ui_dir: str, started_at: float) -> None:
+                 version: str, ui_dir: str, started_at: float,
+                 gateway_prefix: str = "") -> None:
         self.config = config
         self.registry = registry
         self.controller = controller
@@ -45,6 +47,9 @@ class AppContext:
         self.version = version
         self.ui_dir = ui_dir
         self.started_at = started_at
+        # 飞牛统一网关前缀（如 /app/airplay2dlna）。网关把完整路径原样转给
+        # 应用，所以这里保存下来，请求进来时先剥掉，再按内部路由表匹配。
+        self.gateway_prefix = (gateway_prefix or "").rstrip("/")
         self.discovering = threading.Event()
         self.airplay_supervisor = None      # 由 bridge.py 注入
         self.nqptp_supervisor = None        # 由 bridge.py 注入（若由本进程监管）
@@ -144,6 +149,19 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         path = urllib.parse.unquote(parsed.path)
         query = urllib.parse.parse_qs(parsed.query)
+        prefix = self.ctx.gateway_prefix
+        if prefix:
+            if path == prefix:
+                # 飞牛桌面入口的 url 是 /app/<appname>（不带结尾斜杠）。
+                # 若不跳转，页面里 css/app.css 这类相对路径会被解析到 /app/css/...，
+                # 静态资源全部 404 → 用户看到空白页。统一补一个结尾斜杠。
+                self.send_response(HTTPStatus.TEMPORARY_REDIRECT)
+                self.send_header("Location", prefix + "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if path.startswith(prefix + "/"):
+                path = path[len(prefix):]
         try:
             if path.startswith("/api/"):
                 self._handle_api(method, path, query)
@@ -472,15 +490,60 @@ class _ConnectionCloser:
             pass
 
 
-class WebServer:
-    """封装 :class:`ThreadingHTTPServer` 的启停。"""
+class UnixHTTPServer(ThreadingHTTPServer):
+    """在 Unix 域套接字上提供 HTTP 服务。
 
-    def __init__(self, host: str, port: int, ctx: AppContext) -> None:
+    飞牛应用中心/桌面入口通过「统一网关」（fngateway）访问应用：`/app/<appname>/...`
+    会由网关转发到本 socket。用 socket 而不是 TCP 端口的好处是走面板自身链路，
+    HTTPS / FnConnect 远程访问都不会出现混合内容拦截。
+    """
+
+    address_family = socket.AF_UNIX
+
+    def server_bind(self) -> None:  # noqa: D102 - 覆盖以避免对 socket 路径做 DNS 解析
+        path = str(self.server_address)
+        try:
+            if os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+        self.socket.bind(path)
+        self.server_name = "unix"
+        self.server_port = 0
+        try:
+            # 网关进程不一定是本应用用户，套接字需要可读写
+            os.chmod(path, 0o666)
+        except OSError:
+            pass
+
+    def server_activate(self) -> None:  # noqa: D102
+        self.socket.listen(self.request_queue_size)
+
+    def get_request(self):  # noqa: D102
+        conn, _ = self.socket.accept()
+        return conn, ("unix", 0)
+
+    def server_close(self) -> None:  # noqa: D102
+        super().server_close()
+        try:
+            os.unlink(str(self.server_address))
+        except OSError:
+            pass
+
+
+class WebServer:
+    """封装 HTTP 服务的启停：TCP 端口（DLNA 拉流 + 直连访问）与飞牛网关套接字。"""
+
+    def __init__(self, host: str, port: int, ctx: AppContext,
+                 socket_path: str = "") -> None:
         self.host = host
         self.port = port
         self.ctx = ctx
+        self.socket_path = socket_path or ""
         self._httpd: Optional[ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
+        self._unixd: Optional[UnixHTTPServer] = None
+        self._unix_thread: Optional[threading.Thread] = None
 
     @property
     def address(self) -> tuple[str, int]:
@@ -497,7 +560,42 @@ class WebServer:
         self._thread.start()
         log.info("Web UI / REST API 已监听 %s:%s", self.host, self.port)
 
+        if not self.socket_path:
+            return
+        try:
+            parent = os.path.dirname(self.socket_path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            self._unixd = UnixHTTPServer(self.socket_path, Handler)  # type: ignore[arg-type]
+            self._unixd.daemon_threads = True
+            self._unixd.ctx = self.ctx  # type: ignore[attr-defined]
+            self._unix_thread = threading.Thread(target=self._unixd.serve_forever,
+                                                 name="http-unix", daemon=True)
+            self._unix_thread.start()
+            log.info("已通过飞牛统一网关套接字暴露 Web UI: %s (前缀 %s)",
+                     self.socket_path, self.ctx.gateway_prefix or "-")
+        except Exception:  # noqa: BLE001 - 套接字不可用不应导致应用启动失败
+            self._unixd = None
+            log.exception("创建飞牛网关套接字失败（不影响 TCP 端口访问）: %s",
+                          self.socket_path)
+
     def stop(self) -> None:
+        if self._unixd is not None:
+            try:
+                self._unixd.shutdown()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._unixd.server_close()
+            except Exception:  # noqa: BLE001
+                pass
+        if self._unix_thread is not None and self._unix_thread.is_alive():
+            self._unix_thread.join(timeout=5.0)
+        try:
+            if self.socket_path and os.path.exists(self.socket_path):
+                os.unlink(self.socket_path)
+        except OSError:
+            pass
         if self._httpd is not None:
             try:
                 self._httpd.shutdown()

@@ -36,6 +36,11 @@ UI_DIR="$APP/ui"
 BIN_DIR="$APP/server/bin"
 WATCHDOG="$APP/server/nqptp-watchdog.sh"
 
+# 飞牛统一网关：桌面/应用中心入口通过该 Unix 套接字 + 路径前缀访问 Web UI
+GATEWAY_SOCKET="${GATEWAY_SOCKET:-$APP/airplay2dlna.sock}"
+GATEWAY_PREFIX="${GATEWAY_PREFIX:-/app/airplay2dlna}"
+export GATEWAY_SOCKET GATEWAY_PREFIX
+
 # python312 是 manifest 中声明的依赖运行时
 PYTHON="/var/apps/python312/target/bin/python3"
 if [ ! -x "$PYTHON" ]; then
@@ -159,7 +164,13 @@ start_bridge() {
     if id -u "$RUN_USER" >/dev/null 2>&1; then
         chown -R "$RUN_USER" "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
         chmod 750 "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
+        # 网关套接字建在应用目录里：降权后的应用用户必须能在此创建/删除套接字，
+        # 否则统一网关拿不到后端，桌面入口就是空白页。
+        chgrp "$RUN_USER" "$APP" 2>/dev/null || true
+        chmod 775 "$APP" 2>/dev/null || true
     fi
+    # 清掉上一轮遗留的套接字，避免网关连到已死的后端
+    rm -f "$GATEWAY_SOCKET" 2>/dev/null || true
 
     : >> "$MAIN_LOG"
     # 注意：不能用 `nohup run_as_app_user ...` —— nohup 是外部命令，看不见 shell 函数。
@@ -229,6 +240,7 @@ stop_bridge() {
         kill -KILL "$spid" 2>/dev/null
     fi
     rm -f "$BRIDGE_PID" "$SHAIRPORT_PID"
+    rm -f "$GATEWAY_SOCKET" 2>/dev/null || true
 }
 
 # ---------------------------------------------------------------- 命令

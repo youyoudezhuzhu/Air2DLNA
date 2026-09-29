@@ -44,6 +44,8 @@ from airplay2dlna.timeline import AudioTimeline  # noqa: E402
 log = logging.getLogger("bridge")
 
 DEFAULT_VERSION = "1.0.0"
+# 飞牛统一网关为应用分配的路径前缀（与 app/ui/config 的 gatewayPrefix 保持一致）
+DEFAULT_GATEWAY_PREFIX = "/app/airplay2dlna"
 
 
 class AudioPipeReader(threading.Thread):
@@ -145,6 +147,9 @@ class Bridge:
         self.ui_dir = args.ui_dir
         self.bin_dir = args.bin_dir
         self.version = args.version
+        # 飞牛统一网关：桌面/应用中心通过 Unix 套接字 + 路径前缀访问 Web UI
+        self.gateway_socket = args.gateway_socket
+        self.gateway_prefix = args.gateway_prefix
 
         os.makedirs(self.config_dir, exist_ok=True)
         os.makedirs(self.var_dir, exist_ok=True)
@@ -229,9 +234,11 @@ class Bridge:
             version=self.version,
             ui_dir=self.ui_dir,
             started_at=self._started_at,
+            gateway_prefix=self.gateway_prefix,
         )
         ctx.airplay_supervisor = self._shairport
-        self._web = webui.WebServer("0.0.0.0", int(self.config.get("http_port")), ctx)
+        self._web = webui.WebServer("0.0.0.0", int(self.config.get("http_port")), ctx,
+                                    socket_path=self.gateway_socket)
 
         # 配置热更新
         self.config.add_change_listener(self._on_config_change)
@@ -378,6 +385,14 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     parser.add_argument("--ui-dir", default=os.path.join(appdest, "ui"))
     parser.add_argument("--bin-dir", default=os.path.join(appdest, "server", "bin"))
     parser.add_argument("--version", default=_env("TRIM_APPVER", DEFAULT_VERSION))
+    parser.add_argument(
+        "--gateway-socket", default=_env("GATEWAY_SOCKET", ""),
+        help="飞牛统一网关套接字路径（默认取 GATEWAY_SOCKET 环境变量，留空则不启用）",
+    )
+    parser.add_argument(
+        "--gateway-prefix", default=_env("GATEWAY_PREFIX", DEFAULT_GATEWAY_PREFIX),
+        help="飞牛统一网关路径前缀，例如 /app/airplay2dlna",
+    )
     parser.add_argument(
         "--no-shairport", action="store_true",
         help="不启动 shairport-sync（供集成测试使用，避免与已安装实例抢占 7000 端口）",

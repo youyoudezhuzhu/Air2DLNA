@@ -28,5 +28,10 @@ fi
 if id -u "$RUN_USER" >/dev/null 2>&1; then
     chown -R "$RUN_USER" "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
     chmod 750 "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
+    # 飞牛统一网关套接字位于应用目录内（airplay2dlna.sock），桌面入口能否打开
+    # 取决于降权后的应用用户能否在此创建套接字 —— 给组写权限并清掉残留套接字。
+    chgrp "$RUN_USER" "$APP" 2>/dev/null || true
+    chmod 775 "$APP" 2>/dev/null || true
+    rm -f "$APP/airplay2dlna.sock" 2>/dev/null || true
 fi
 exit 0

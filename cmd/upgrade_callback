@@ -17,6 +17,10 @@ chmod -R a+rX "$APP" 2>/dev/null
 rm -f "$VAR"/audio.fifo "$VAR"/metadata.fifo "$VAR"/*.pid "$VAR"/nqptp-watchdog.stop 2>/dev/null
 if id -u "$RUN_USER" >/dev/null 2>&1; then
     chown -R "$RUN_USER" "$VAR" "$ETC" 2>/dev/null
+    # 升级会重新解包应用目录，套接字的写权限可能被覆盖掉，这里补回来
+    chgrp "$RUN_USER" "$APP" 2>/dev/null || true
+    chmod 775 "$APP" 2>/dev/null || true
+    rm -f "$APP/airplay2dlna.sock" 2>/dev/null || true
 fi
 "$APP/cmd/main" start >/dev/null 2>&1 || true
 exit 0
