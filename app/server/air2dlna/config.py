@@ -191,6 +191,27 @@ def validate_value(key: str, value: Any) -> Any:
         if ch != 2:
             raise ConfigError("第一阶段只支持 2 声道")
         return ch
+    if key == "recovery_mode":
+        mode = str(value).strip().lower()
+        if mode not in ("current", "keepalive", "prewarm", "auto"):
+            raise ConfigError("recovery_mode 只能是 current / keepalive / prewarm / auto")
+        return mode
+    if key == "pause_keepalive_timeout_seconds":
+        try:
+            sec = float(value)
+        except (TypeError, ValueError):
+            raise ConfigError("pause_keepalive_timeout_seconds 必须是数字") from None
+        if not (5 <= sec <= 3600):
+            raise ConfigError("pause_keepalive_timeout_seconds 必须在 5-3600 秒之间")
+        return sec
+    if key == "resume_prebuffer_ms":
+        try:
+            ms = int(value)
+        except (TypeError, ValueError):
+            raise ConfigError("resume_prebuffer_ms 必须是整数") from None
+        if not (0 <= ms <= 5000):
+            raise ConfigError("resume_prebuffer_ms 必须在 0-5000 毫秒之间")
+        return ms
     raise ConfigError(f"未知配置项: {key}")
 
 
