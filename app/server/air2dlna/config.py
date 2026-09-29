@@ -42,6 +42,15 @@ DEFAULTS: dict[str, Any] = {
     # 暂停恢复时先写入的静音时长（毫秒）：让渲染器一连上新 URI 就有数据可读。
     # 默认 0 = 不预填（保持原行为）。仅用于 A/B 测试「预填数据能否缩短出声时间」。
     "resume_prebuffer_ms": 0,
+    # 暂停恢复策略（实验开关，GPT 计划 Phase 1 的目标是 keepalive）：
+    #   current   = 稳定后备：DLNA Pause → 恢复时换代 + SetURI + Play（约 2~4 秒）
+    #   keepalive = 暂停时不碰渲染器（保持 PLAYING），HTTP 输出层送静音；
+    #               恢复时直接切回真实 PCM（目标 <500ms，失败自动回落 current）
+    #   prewarm   = 暂停期间提前换代 + SetURI（不 Play），恢复时只补一个 Play
+    #   auto      = 先 keepalive，失败/超时自动退化到 current
+    "recovery_mode": "keepalive",
+    # keepalive 最长保持时间（秒）：超时后回落 current，避免音箱长期空转
+    "pause_keepalive_timeout_seconds": 30,
     # GENA 不可用时的位置轮询间隔（秒）
     "metadata_poll_seconds": 3.0,
     # SSDP 后台重扫间隔（秒）
