@@ -1,7 +1,7 @@
 # TECHNICAL_DESIGN.md
 
 **项目**：Air2DLNA 音频桥接（飞牛 OS 原生 FPK 应用）
-**目标产物**：`Air2DLNA-1.0.3.fpk`
+**目标产物**：`Air2DLNA-1.0.4.fpk`
 **约束**：禁止 Docker / Podman / LXC / 容器套容器，必须原生进程运行在飞牛 OS 主机
 **文档状态**：编码前的技术评估（本文档为实现的规格来源）
 

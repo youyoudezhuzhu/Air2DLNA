@@ -174,6 +174,36 @@ class FixedLatencyAbsorptionTests(unittest.TestCase):
         self.assertIn("av_offset_ms", getattr(config, "update_dict", {}),
                       "学到的固定延迟应写回配置，下次播放无需重新学习")
 
+    def test_drift_samples_are_not_polluted_across_rebuilds(self) -> None:
+        """换代会改变基准偏移，旧样本必须清空。
+
+        真机 1.0.3 日志：换代前的样本是 23 秒级、换代后是 3~4 秒级，混在同一个
+        样本窗口里让相邻差值恒为十几秒 → 固定延迟永远识别不出来 →
+        「重建间隔被拉长，但周期性声音变小依旧存在」。
+        """
+        controller, _config, ring, timeline, record = _build()
+
+        # 第一次：巨大的偏差（23 秒）→ 超补偿上限 → 必须重建
+        _set_offset(timeline, 48.0)
+        timeline.update_renderer_position(25000.0)
+        for _ in range(controller.DRIFT_STABLE_SAMPLES):
+            controller._check_drift(record)
+        self.assertEqual(1, controller._drift_rebuilds, "超上限偏差应触发重建")
+        self.assertEqual([], list(controller._drift_history),
+                         "换代后不得残留上一代的样本（否则固定延迟永远识别不出来）")
+
+        # 第二次：换代后渲染器稳定落后 3 秒 → 应被补偿，而不是再来一次重建。
+        # 建模方式：渲染器实际从曲目 45 秒处开始出声（比真实位置 48 秒落后 3 秒），
+        # 之后 rel_time 正常增长 → 恒定 3 秒偏差。
+        timeline.begin_generation(ring.generation, 45000.0)
+        for i in range(controller.DRIFT_STABLE_SAMPLES):
+            _set_offset(timeline, 48.0 + i * 3.0)
+            timeline.update_renderer_position(i * 3000.0)
+            controller._check_drift(record)
+        self.assertEqual(1, controller._drift_rebuilds,
+                         "固定延迟应被补偿，不应再次重建会话")
+        self.assertGreater(timeline.renderer_latency_ms, 2000.0, "应补偿约 3 秒的固定延迟")
+
     def test_growing_drift_still_rebuilds(self) -> None:
         """真正的漂移（持续变大）仍要重建，不能被当成固定延迟吞掉。"""
         controller, _config, ring, timeline, record = _build()

@@ -751,6 +751,7 @@ class BridgeController:
             return
         self._last_stall_rebuild = now
         log.warning("渲染器 %.0fs 未拉取音频流（seek/恢复后未重连），重建 DLNA 会话", idle)
+        self._drift_history.clear()
         self._begin_new_generation(reason="stalled", offset_ms=None)
         self._start_dlna_session(reason="stalled")
 
@@ -809,6 +810,10 @@ class BridgeController:
         # ② 换代时 begin_generation() 会把「当前曲目位置」记为新基准偏移，
         #    漂移检测才有正确的参照。否则漂移恒等于曲目绝对位置，每 2~3 秒
         #    重建一次，形成死循环。
+        # 换代后基准变了，**旧样本必须清空** —— 否则上一代那个大偏差会一直留在
+        # 样本窗口里，让相邻差值永远超限，固定延迟再也无法被识别（表现为「重建
+        # 间隔被拉长但周期性声音变小依旧存在」）。
+        self._drift_history.clear()
         self._begin_new_generation(reason="drift", offset_ms=None)
         self._start_dlna_session(reason="drift")
 

@@ -212,8 +212,10 @@ class DriftRebuildTests(unittest.TestCase):
             controller._check_drift(record)
         self.assertEqual(1, controller._drift_rebuilds, "冷却期内不应重复重建")
 
-        # 绕过冷却，触发到上限为止
-        for _ in range(controller.DRIFT_REBUILD_LIMIT + 3):
+        # 绕过冷却，触发到上限为止。注意每次重建都会清空样本窗口（基准已变），
+        # 所以要留足「重新积累 DRIFT_STABLE_SAMPLES 个样本」的调用次数。
+        rounds = (controller.DRIFT_STABLE_SAMPLES + 1) * (controller.DRIFT_REBUILD_LIMIT + 3)
+        for _ in range(rounds):
             controller._last_drift_rebuild = time.monotonic() - 3600
             controller._check_drift(record)
         self.assertEqual(
