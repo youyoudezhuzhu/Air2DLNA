@@ -884,6 +884,49 @@ class ResumeInPlaceGuardTests(unittest.TestCase):
                          "状态未知时不得假设可原地续播（真机代价是无声）")
 
 
+class ResumedWithoutEventTests(unittest.TestCase):
+    """拖动进度条时 AirPlay 可能**不发任何事件** —— 靠"持续收到 PCM"兜底恢复。
+
+    真机证据：拖动进度条后 9 秒内日志里没有任何 seek/恢复事件，只有 PCM 从新位置送来；
+    状态机停在 PAUSED、音箱也一直停着 —— 这就是「拖进度条后再也放不出声音」的根因。
+    """
+
+    def test_sustained_pcm_while_paused_triggers_recovery(self) -> None:
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        generation_before = ring.generation
+        created_before = len(streams.created)
+
+        # 没有任何事件，PCM 却持续送来（0.6 秒的量）
+        controller.on_audio_bytes(b"\x00" * int(176400 * 0.6))
+        controller._check_resumed_without_event()
+
+        self.assertEqual(generation_before + 1, ring.generation, "应主动换代恢复播放")
+        self.assertEqual(created_before + 1, len(streams.created), "应换新 URI")
+
+    def test_small_tail_data_does_not_trigger(self) -> None:
+        controller, _, ring, timeline, _, _ = _build()
+        controller._handle_play(False)
+        controller._handle_pause()
+        generation_before = ring.generation
+
+        controller.on_audio_bytes(b"\x00" * 4096)     # 暂停瞬间的尾部残留
+        controller._check_resumed_without_event()
+
+        self.assertEqual(generation_before, ring.generation, "少量尾部数据不得误触发")
+
+    def test_counter_resets_after_recovery(self) -> None:
+        controller, _, ring, timeline, _, _ = _build()
+        controller._handle_play(False)
+        controller._handle_pause()
+        controller.on_audio_bytes(b"\x00" * int(176400 * 0.6))
+        controller._check_resumed_without_event()
+
+        self.assertEqual(0, controller._paused_audio_bytes, "触发后计数应清零")
+
+
 class KeepaliveHealthTests(unittest.TestCase):
     """GPT Phase 2：keepalive 期间的断流检测 + Renderer Profile 记忆。"""
 

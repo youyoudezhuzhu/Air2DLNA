@@ -198,6 +198,9 @@ class BridgeController:
     DIAGNOSTIC_INTERVAL_SECONDS = 15.0
     #: keepalive 模式下暂停时的位置采样间隔（秒）：保持时间线快照
     KEEPALIVE_POSITION_SAMPLE_SECONDS = 1.0
+    #: 暂停期间累计收到多少音频（秒）就认定 AirPlay 已恢复播放（兜底，无事件也生效）。
+    #: 取 0.5 秒：暂停时残留的尾部数据不会超过这个量。
+    RESUMED_AUDIO_THRESHOLD_SECONDS = 0.5
     #: 暂停恢复时允许「暂停位置」领先已写入数据的最大秒数。
     #: AirPlay 上报的位置必然略微领先 FIFO 已写入的数据（真机约 10 毫秒），
     #: 但领先过多说明位置本身不可信（或数据早已被覆盖），此时不该启用方案 A。
@@ -287,6 +290,8 @@ class BridgeController:
         #: Renderer Profile（按 UDN）：记录该设备是否能可靠保持 keepalive。
         #: None/缺失 = 未验证；False = 已验证不可用（下次暂停直接走 current）
         self._keepalive_capable: dict[str, bool] = {}
+        #: 暂停状态下累计收到的 PCM 字节数（用于「AirPlay 已恢复但没有事件」的兜底）
+        self._paused_audio_bytes = 0
         #: keepalive 期间连续没有客户端的采样次数（用于判定断流）
         self._keepalive_idle_ticks = 0
         #: keepalive 模式：暂停期间渲染器保持 PLAYING，输出层改送静音
@@ -348,6 +353,13 @@ class BridgeController:
     def on_audio_bytes(self, data: bytes) -> None:
         """音频读取线程回调：把 FIFO 数据推进环形缓冲。"""
         self.ring.append(data)
+        # 兜底：暂停期间持续收到 PCM，说明 AirPlay 其实已经恢复（真机实测拖动进度条时
+        # AirPlay 可能**完全不发** pres/pbeg/pfls 任何事件），此时只靠事件永远醒不过来。
+        # 这里只做计数，实际恢复动作交给轮询线程（不在音频线程里做网络操作）。
+        if self.state.state == PAUSED:
+            self._paused_audio_bytes += len(data)
+        else:
+            self._paused_audio_bytes = 0
         if self._awaiting_new_stream:
             # 仍有 PCM 进来 → 播放流并未真正结束（只是事件次序），立刻退出过渡态
             self._cancel_transition("仍在推送 PCM")
@@ -413,11 +425,19 @@ class BridgeController:
             self.timeline.on_pffr(item.text)
         elif code == "pvol":
             self._handle_volume(item)
+        elif code in (".", "pffr", "phb0", "phbt", "prsm", "psnc"):
+            # 关键时序事件：正常不刷屏，但定位 seek/恢复问题必看
+            log.info("AirPlay 事件: %s %s", code, (item.text or "")[:60])
         elif code == "PICT":
             with self._artwork_lock:
                 self.state.album_art = bytes(item.data)
                 self.state.album_art_mime = _sniff_image_mime(item.data)
             log.info("收到封面图 %d 字节", len(item.data))
+        else:
+            # 未识别的事件也要留痕：真机上「拖动进度条无反应」很可能就是某个
+            # 我们没处理的事件（或干脆什么事件都没发，靠音频兜底恢复）
+            log.debug("AirPlay 未识别事件: type=%s code=%s payload=%s",
+                      item.type, code, (item.text or "")[:60])
 
     def _handle_core(self, code: str, item: MetadataItem) -> None:
         text = item.text
@@ -626,6 +646,31 @@ class BridgeController:
         self._keepalive_capable[udn] = False
         log.warning("keepalive: 标记渲染器 %s 不支持 keepalive（%s）——"
                     "后续暂停将直接使用 current 方案", udn or "?", reason)
+
+    def _check_resumed_without_event(self) -> None:
+        """兜底：暂停中却持续收到 PCM → 主动恢复播放。
+
+        真机实测：iPhone 拖动进度条时 AirPlay **可能不发任何事件**（既没有
+        ``pfls``/``pdis``，也没有 ``pres``/``pbeg``），只有 PCM 数据从新位置继续送来。
+        只靠事件的状态机会一直停在 PAUSED、音箱也一直停着 —— 这就是「拖动进度条后
+        再也放不出声音」的直接原因。这里以"数据流已经恢复"为事实依据主动恢复。
+        """
+        with self._lock:
+            if self.state.state != PAUSED or self._silence_active:
+                return
+            pending = self._paused_audio_bytes
+        threshold = int(self.ring.byte_rate * self.RESUMED_AUDIO_THRESHOLD_SECONDS)
+        if pending < threshold:
+            return
+        log.info("检测到暂停期间持续收到音频（%.1fs），但没有任何 AirPlay 恢复事件 —— "
+                 "判定播放已恢复，主动重建 DLNA 会话（新 generation 的 0 点 = 当前位置）",
+                 pending / float(self.ring.byte_rate or 1))
+        with self._lock:
+            self._paused_audio_bytes = 0
+        self._stop_pause_keepalive("音频已恢复")
+        self._clear_pause_recovery("音频已恢复")
+        self._begin_new_generation(reason="audio-resumed", offset_ms=None)
+        self._start_dlna_session(reason="audio-resumed")
 
     def _check_keepalive_health(self) -> None:
         """keepalive 期间的断流检测（GPT 需求 Phase 2）。
@@ -1393,6 +1438,8 @@ class BridgeController:
                 self._check_transition_timeout()
                 # 暂停恢复（方案 A）的成功判定 / 超时 fallback
                 self._check_pause_recovery()
+                # 兜底：暂停中却持续收到音频 → AirPlay 已恢复（无事件也生效）
+                self._check_resumed_without_event()
                 # keepalive（方案 A'）断流检测与超时退化（GPT Phase 2）
                 self._check_keepalive_health()
                 self._check_keepalive_timeout()
