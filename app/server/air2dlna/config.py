@@ -66,6 +66,8 @@ EDITABLE_KEYS = {
     "av_offset_ms",
     "drift_threshold_ms",
     "resume_prebuffer_ms",
+    "recovery_mode",
+    "pause_keepalive_timeout_seconds",
     "metadata_poll_seconds",
     "rediscover_seconds",
 }

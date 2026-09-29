@@ -173,6 +173,10 @@ class StreamSession:
     on_bytes: Optional[Callable[[int], None]] = None
     #: 建连回调（控制器用它记录恢复耗时里的 T8：渲染器对新 URI 发起 GET）
     on_connect: Optional[Callable[[], None]] = None
+    #: 暂停 keepalive（方案 A）：为真时输出层改为持续发送静音 PCM。
+    #: **静音只在输出层生成，绝不写入环形缓冲** —— 环形缓冲承载的是 AirPlay 真实
+    #: 时间线，不能被合成音频污染（否则位置/seek/时间线全部失真）。
+    silence_mode: bool = False
 
     @property
     def byte_rate(self) -> int:
@@ -339,6 +343,28 @@ class StreamManager:
             chunk_size = 32 * 1024
             last_progress = time.monotonic()
             while not session.closed:
+                # 暂停 keepalive：输出层生成静音（不读环形缓冲、不污染 AirPlay 时间线）。
+                # 渲染器因此一直有数据可拉、保持 PLAYING，恢复时无需任何 UPnP 操作。
+                if session.silence_mode:
+                    if (session.total_bytes is not None
+                            and session.bytes_served >= session.total_bytes):
+                        break
+                    silence = b"\x00" * chunk_size
+                    wfile.write(silence)
+                    try:
+                        wfile.flush()
+                    except Exception:  # noqa: BLE001
+                        break
+                    session.bytes_served += len(silence)
+                    session.last_activity = time.monotonic()
+                    if session.on_bytes is not None:
+                        try:
+                            session.on_bytes(session.bytes_served)
+                        except Exception:  # noqa: BLE001
+                            pass
+                    # 按实时速率节流（44.1k/16bit/2ch 时 32KB ≈ 0.19s）
+                    time.sleep(chunk_size / float(session.byte_rate or 176400))
+                    continue
                 # 注意：有暂停恢复映射时不要把 offset 重置回 0（否则又会从本代起点播）
                 if mapped_offset is None and range_start == 0 and session.bytes_served == 0:
                     offset = 0

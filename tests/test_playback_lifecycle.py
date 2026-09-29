@@ -697,6 +697,107 @@ class ResumeTimelineTests(unittest.TestCase):
         self.assertEqual(0, ring.write_offset, "默认不应预填任何数据")
 
 
+class PauseKeepaliveTests(unittest.TestCase):
+    """方案 A（keepalive）：暂停时不操作渲染器，输出层送静音；恢复无需任何 UPnP 操作。"""
+
+    def _with_mode(self, mode: str):
+        controller, config, ring, timeline, _, streams = _build()
+        config["recovery_mode"] = mode
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        return controller, config, ring, timeline, streams
+
+    def test_keepalive_pause_does_not_touch_renderer(self) -> None:
+        controller, _, ring, _, streams = self._with_mode("keepalive")
+        record = controller.registry.selected()
+        calls: list[str] = []
+        record.client.pause = lambda *a, **kw: (calls.append("pause"), True)[1]
+        record.client.set_av_transport_uri = lambda *a, **kw: (calls.append("set_uri"), True)[1]
+
+        controller._handle_pause()
+
+        self.assertEqual([], calls, "keepalive 不得对渲染器做任何 UPnP 操作")
+        self.assertTrue(controller._silence_active)
+        session = streams.get(controller._gen_token)
+        self.assertTrue(session.silence_mode, "输出层应切换为静音")
+        self.assertEqual(state_mod.PAUSED, controller.state.state)
+
+    def test_keepalive_resume_needs_no_upnp(self) -> None:
+        controller, _, ring, _, streams = self._with_mode("keepalive")
+        controller._handle_pause()
+        generation_before = ring.generation
+        created_before = len(streams.created)
+        record = controller.registry.selected()
+        calls: list[str] = []
+        for name in ("play", "pause", "stop", "set_av_transport_uri"):
+            setattr(record.client, name, lambda *a, _n=name, **kw: (calls.append(_n), True)[1])
+
+        controller._handle_play(True)                      # iPhone 点恢复
+
+        self.assertEqual([], calls, "恢复应完全不需要 UPnP 操作（渲染器一直在播）")
+        self.assertEqual(generation_before, ring.generation, "不得换代")
+        self.assertEqual(created_before, len(streams.created), "不得换 URI")
+        session = streams.get(controller._gen_token)
+        self.assertFalse(session.silence_mode, "输出层应切回真实 PCM")
+        self.assertFalse(controller._silence_active)
+        self.assertEqual(state_mod.PLAYING, controller.state.state)
+
+    def test_keepalive_timeout_degrades_to_current(self) -> None:
+        controller, _, ring, _, streams = self._with_mode("keepalive")
+        controller._handle_pause()
+        session = streams.get(controller._gen_token)
+        controller._silence_started_at = time.monotonic() - 999.0
+
+        controller._check_keepalive_timeout()
+
+        self.assertFalse(controller._silence_active, "超时应退出 keepalive")
+        self.assertFalse(session.silence_mode)
+        self.assertEqual(state_mod._MODE_PAUSE, controller._intent.mode,
+                         "超时后退化为 current（真正暂停渲染器）")
+
+    def test_seek_exits_keepalive(self) -> None:
+        controller, _, ring, _, streams = self._with_mode("keepalive")
+        controller._handle_pause()
+        session = streams.get(controller._gen_token)
+
+        controller._handle_flush("777")
+
+        self.assertFalse(controller._silence_active)
+        self.assertFalse(session.silence_mode)
+
+    def test_default_mode_is_current(self) -> None:
+        controller, _, ring, _, _, _ = _build()
+        self.assertEqual("current", controller._recovery_mode(), "默认不得启用实验模式")
+
+
+class SilenceOutputLayerTests(unittest.TestCase):
+    """静音只在 HTTP 输出层产生，绝不写入环形缓冲。"""
+
+    def test_silence_mode_emits_zeros_and_keeps_ring_untouched(self) -> None:
+        import io
+
+        from air2dlna.stream import StreamManager
+
+        ring = PcmRingBuffer(SAMPLE_RATE * CHANNELS * 2 * 10, sample_rate=SAMPLE_RATE,
+                            channels=CHANNELS)
+        ring.append(b"\x7f" * (SAMPLE_RATE * CHANNELS * 2 * 2))       # 环形缓冲里是真实音频
+        manager = StreamManager(ring)
+        session = manager.new_generation("l16")
+        session.total_bytes = 64 * 1024                                # 发完两块就结束
+        session.silence_mode = True
+        out = io.BytesIO()
+        write_offset_before = ring.write_offset
+
+        manager.serve(session, out, range_start=0)
+
+        data = out.getvalue()
+        self.assertTrue(data.startswith(b"\x00"), "应发送静音而不是环形缓冲内容")
+        self.assertEqual(b"\x00", data[0:1])
+        self.assertFalse(b"\x7f" in data, "不得把环形缓冲里的真实音频混进静音流")
+        self.assertEqual(write_offset_before, ring.write_offset,
+                         "环形缓冲绝不能被合成静音污染")
+
+
 class StreamRecoveryMappingTests(unittest.TestCase):
     """服务端映射：暂停恢复期间 Range: bytes=0- 从暂停位置读数据（WAV header 语义不变）。"""
 

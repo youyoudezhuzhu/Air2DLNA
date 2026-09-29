@@ -172,6 +172,8 @@ class _Intent:
     token: str = ""          # 要播放的流 token
     volume: Optional[int] = None
     revision: int = 0
+    #: 是否在 SetAVTransportURI 之后立即发送 Play（prewarm 预热时置 False）
+    play: bool = True
     #: 是否允许由该意图触发 ``SetAVTransportURI``。
     #: 复用同一个 generation 时必须为 False —— DLNA 语义下重设 URI 会让渲染器
     #: 从该资源的**开头**重新播放（真机现象：「暂停后恢复变成从头播放」）。
@@ -193,6 +195,8 @@ class BridgeController:
     REBUILD_COOLDOWN_SECONDS = 10.0
     #: 诊断日志输出间隔（秒）
     DIAGNOSTIC_INTERVAL_SECONDS = 15.0
+    #: keepalive 模式下暂停时的位置采样间隔（秒）：保持时间线快照
+    KEEPALIVE_POSITION_SAMPLE_SECONDS = 1.0
     #: 暂停恢复时允许「暂停位置」领先已写入数据的最大秒数。
     #: AirPlay 上报的位置必然略微领先 FIFO 已写入的数据（真机约 10 毫秒），
     #: 但领先过多说明位置本身不可信（或数据早已被覆盖），此时不该启用方案 A。
@@ -279,6 +283,10 @@ class BridgeController:
         #: 方案 A 启动时的 HTTP 连接计数基线（用于判断渲染器是否真的重连了）
         self._recovery_range_baseline = 0
         self._recovery_started_at = 0.0
+        #: keepalive 模式：暂停期间渲染器保持 PLAYING，输出层改送静音
+        self._silence_active = False
+        self._silence_started_at = 0.0
+        self._silence_generation = 0
         #: 一次暂停恢复的分段耗时记录（GPT 需求 T0~T14）
         self._resume_timeline: Optional[_ResumeTimeline] = None
         #: 渲染器是否表现出「Stop 后会自己重连 HTTP」的能力。
@@ -437,6 +445,18 @@ class BridgeController:
     # ------------------------------------------------------------- 状态迁移
     def _handle_play(self, is_resume: bool) -> None:
         self._refresh_base_url()
+        if is_resume and self._silence_active:
+            # keepalive(方案A) 的恢复：渲染器一直在 PLAYING、URI 从未改变，
+            # 因此**不做任何 UPnP 操作**，只把输出层切回真实 PCM 即可。
+            self._resume_timeline = _ResumeTimeline(self.ring.byte_rate, "keepalive")
+            self._resume_timeline.mark("T0_airplay_resume")
+            self._stop_pause_keepalive("恢复播放")
+            self.timeline.on_resume()
+            with self._lock:
+                self.state.state = PLAYING
+            self._resume_timeline.mark("T2_fallback_decided")
+            log.info("keepalive(方案A): 恢复播放 —— 未换代、未 SetURI、未发送任何 UPnP 命令")
+            return
         # T0：AirPlay 的 pres/pbeg 到达 —— 一次恢复的计时起点
         self._resume_timeline = _ResumeTimeline(self.ring.byte_rate,
                                                 "resume" if is_resume else "pbeg")
@@ -507,6 +527,76 @@ class BridgeController:
         self._uri_count = 0
         self._begin_new_generation(reason="pbeg", offset_ms=None)
         self._start_dlna_session(reason="pbeg")
+
+    def _recovery_mode(self) -> str:
+        """暂停恢复策略（实验开关）：current / keepalive / prewarm / auto。"""
+        mode = str(self.config.get("recovery_mode") or "current").strip().lower()
+        return mode if mode in ("current", "keepalive", "prewarm", "auto") else "current"
+
+    # ---------------------------------------------------------- Pause Keepalive
+    def _start_pause_keepalive(self, position: Optional[float], offset: Optional[int]) -> bool:
+        """方案 A：暂停时不碰渲染器，由 HTTP 输出层改送静音。
+
+        真机问题：固件把 UPnP ``Pause`` 做成 ``Stop``，恢复时必须
+        ``SetAVTransportURI + Play`` 重建音频管线 —— 音箱重新预缓冲，等待 2~4 秒。
+        本方案让渲染器**一直保持 PLAYING**：暂停期间服务端按实时速率送出静音 PCM
+        （静音在**输出层**生成，绝不写入环形缓冲，AirPlay 时间线保持真实），
+        恢复时直接切回真实 PCM —— 无需任何 UPnP 操作，理论上立即出声。
+        """
+        with self._lock:
+            token = self._gen_token
+        session = self.streams.get(token) if token else None
+        if session is None or session.closed:
+            log.info("keepalive: 当前没有可用的流会话，退回 current 方案")
+            return False
+        self._silence_active = True
+        self._silence_started_at = time.monotonic()
+        self._silence_generation = self.ring.generation
+        session.silence_mode = True
+        with self._lock:
+            self.state.state = PAUSED
+        log.info(
+            "keepalive(方案A): 暂停但不操作渲染器（保持 PLAYING），"
+            "HTTP 输出层改为发送静音 gen=%d 暂停位置=%s ms 偏移=%s 超时=%.0fs",
+            self.ring.generation,
+            int(position) if position is not None else "-",
+            offset if offset is not None else "-",
+            self._keepalive_timeout_seconds())
+        return True
+
+    def _stop_pause_keepalive(self, reason: str) -> None:
+        """结束 keepalive：输出层切回真实 PCM。"""
+        if not self._silence_active:
+            return
+        with self._lock:
+            token = self._gen_token
+        session = self.streams.get(token) if token else None
+        if session is not None:
+            session.silence_mode = False
+        elapsed = time.monotonic() - self._silence_started_at
+        self._silence_active = False
+        log.info("keepalive(方案A): 结束静音（%s），输出层切回真实 PCM（保持 %.1fs，"
+                 "期间未对渲染器做任何 UPnP 操作）", reason, elapsed)
+
+    def _keepalive_timeout_seconds(self) -> float:
+        try:
+            value = float(self.config.get("pause_keepalive_timeout_seconds"))
+        except (TypeError, ValueError):
+            return 30.0
+        return max(5.0, min(3600.0, value))
+
+    def _check_keepalive_timeout(self) -> None:
+        """keepalive 超时 → 退化为 current（真正 Pause 渲染器，恢复时走可靠路径）。"""
+        if not self._silence_active:
+            return
+        held = time.monotonic() - self._silence_started_at
+        if held < self._keepalive_timeout_seconds():
+            return
+        log.info("keepalive(方案A): 已保持 %.0fs（超过 %.0fs），退化为 current 方案",
+                 held, self._keepalive_timeout_seconds())
+        self._stop_pause_keepalive("超时退化")
+        # 真正暂停渲染器：之后恢复会走稳定的「换代 + SetURI + Play」
+        self._set_intent(_MODE_PAUSE, self._gen_token)
 
     def _position_to_ring_offset(self, position_ms: Optional[float]) -> Optional[int]:
         """把「曲目位置」换算成当代流内的字节偏移（本代第 0 字节 = 代偏移）。"""
@@ -728,10 +818,22 @@ class BridgeController:
             self.ring.generation,
             int(position) if position is not None else "-",
             offset if offset is not None else "-", self._ring_window_text())
+        mode = self._recovery_mode()
+        if mode in ("keepalive", "auto"):
+            # 方案 A：不调用 UPnP Pause（渲染器保持 PLAYING），输出层送静音
+            if self._start_pause_keepalive(position, offset):
+                self.timeline.on_pause()
+                return
         self.timeline.on_pause()
         with self._lock:
             self.state.state = PAUSED
         self._set_intent(_MODE_PAUSE, self._gen_token)
+        if mode == "prewarm":
+            # 方案 B：暂停期间就把下一代媒体准备好（换代 + SetURI，不 Play），
+            # 让渲染器提前建连并预缓冲；恢复时只需一个 Play。
+            log.info("prewarm(方案B): 暂停后预热下一代流（换代 + SetAVTransportURI，不 Play）")
+            self._begin_new_generation(reason="prewarm", offset_ms=None)
+            self._start_dlna_session(reason="prewarm", play=False)
 
     def _handle_flush(self, payload: str) -> None:
         """``pfls`` / ``pdis``：真实 seek。载荷是要 flush 到的帧号。
@@ -740,6 +842,7 @@ class BridgeController:
         flush 旧 PCM → 新 generation → 新 token/URI → SetAVTransportURI → Play。
         """
         self._cancel_transition("seek/flush")
+        self._stop_pause_keepalive("seek")
         self._clear_pause_recovery("seek")
         self._handled_seek_at = time.monotonic()
         log.info("检测到 seek/flush (frame=%s)：换代并重锚 DLNA 会话", payload or "?")
@@ -813,6 +916,7 @@ class BridgeController:
         with self._lock:
             self._awaiting_new_stream = False
             self._transition_deadline = 0.0
+        self._stop_pause_keepalive("播放结束")
         self._clear_pause_recovery("播放结束")
         self._session_started_at = 0.0
         self._rel_sample = None
@@ -905,19 +1009,20 @@ class BridgeController:
 
     # ------------------------------------------------------------- 意图下发
     def _set_intent(self, mode: str, token: str, volume: Optional[int] = None,
-                    set_uri: bool = True) -> None:
+                    set_uri: bool = True, play: bool = True) -> None:
         with self._intent_lock:
             self._intent.revision += 1
             self._intent.mode = mode
             self._intent.set_uri = set_uri
+            self._intent.play = play
             if token:
                 self._intent.token = token
             if volume is not None:
                 self._intent.volume = volume
         self._intent_event.set()
 
-    def _start_dlna_session(self, reason: str) -> None:
-        """创建新一代流并请求收敛线程去播放它。"""
+    def _start_dlna_session(self, reason: str, play: bool = True) -> None:
+        """创建新一代流并请求收敛线程去播放它（``play=False`` 用于预热）。"""
         self._uri_reason = reason
         record = self.registry.selected()
         if record is None:
@@ -936,7 +1041,7 @@ class BridgeController:
         with self._lock:
             self._gen_token = session.token
             self._paused_with_stop = False
-        self._set_intent(_MODE_PLAY, session.token)
+        self._set_intent(_MODE_PLAY, session.token, play=play)
 
     # ------------------------------------------------------- 收敛线程
     def _worker_loop(self) -> None:
@@ -959,6 +1064,7 @@ class BridgeController:
                     volume=self._intent.volume,
                     revision=self._intent.revision,
                     set_uri=self._intent.set_uri,
+                    play=self._intent.play,
                 )
             retrying = self._converge_dirty and intent.revision == last_revision
             if intent.revision == last_revision and not self._converge_dirty:
@@ -1001,9 +1107,11 @@ class BridgeController:
             return
 
         if intent.mode == _MODE_PLAY:
-            self._do_play(record, client, intent.token, set_uri=intent.set_uri)
+            self._do_play(record, client, intent.token, set_uri=intent.set_uri,
+                          play=intent.play)
 
-    def _do_play(self, record, client, token: str, set_uri: bool = True) -> None:
+    def _do_play(self, record, client, token: str, set_uri: bool = True,
+                 play: bool = True) -> None:
         session = self.streams.get(token)
         if session is None:
             log.warning("流会话不存在（可能已过期）: token=%s", token)
@@ -1095,6 +1203,13 @@ class BridgeController:
             return
         if self._resume_timeline is not None:
             self._resume_timeline.mark("T6_seturi_returned")
+        if not play:
+            # prewarm（方案 B）：只把新 URI 交给渲染器并让它自行建连/预缓冲，
+            # 不发 Play —— 避免暂停期间漏出声音。恢复时只补一个 Play。
+            log.info("prewarm(方案B): 已 SetAVTransportURI 但不 Play，等待用户恢复时再播放")
+            with self._lock:
+                self.state.state = PAUSED
+            return
         # 部分渲染器在 SetAVTransportURI 之后需要短暂准备
         time.sleep(0.3)
         if self._resume_timeline is not None:
@@ -1190,6 +1305,8 @@ class BridgeController:
                 self._check_transition_timeout()
                 # 暂停恢复（方案 A）的成功判定 / 超时 fallback
                 self._check_pause_recovery()
+                # keepalive（方案 A'）超时退化
+                self._check_keepalive_timeout()
                 self._log_diagnostics()
             except Exception:  # noqa: BLE001
                 log.exception("位置轮询异常")
