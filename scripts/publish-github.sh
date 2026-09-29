@@ -84,8 +84,28 @@ cd "$ROOT"
 echo "==> 推送 main"
 git remote remove origin 2>/dev/null || true
 git remote add origin "https://github.com/$REPO.git"
-# 令牌通过临时 header 注入，不写入 .git/config
-git -c http.extraheader="AUTHORIZATION: bearer $GH_TOKEN" push -u origin main --tags
+
+# 通过 GIT_ASKPASS 提供凭据：
+#  * 令牌不出现在命令行（ps 看不到）、不写入 .git/config、不进入 shell 历史；
+#  * 之前用 http.extraheader 的写法 GitHub 不接受，会报
+#    "could not read Username for 'https://github.com'"。
+TOKEN_TMP="$(mktemp)"; chmod 600 "$TOKEN_TMP"; printf '%s' "$GH_TOKEN" > "$TOKEN_TMP"
+ASKPASS_TMP="$(mktemp)"; chmod 700 "$ASKPASS_TMP"
+cat > "$ASKPASS_TMP" <<'ASKPASS_EOF'
+#!/bin/sh
+case "$1" in
+    *Username*) printf '%s' "x-access-token" ;;
+    *Password*) cat "$A2D_TOKEN_FILE" ;;
+    *)          printf '%s' "" ;;
+esac
+ASKPASS_EOF
+cleanup_creds() { rm -f "$TOKEN_TMP" "$ASKPASS_TMP"; }
+trap cleanup_creds EXIT INT TERM
+
+A2D_TOKEN_FILE="$TOKEN_TMP" GIT_ASKPASS="$ASKPASS_TMP" \
+    git push -u origin main --tags
+cleanup_creds
+trap - EXIT INT TERM
 
 if [ -f "$FPK" ]; then
     echo "==> 建立 Release $TAG 并上传 $(basename "$FPK")"
