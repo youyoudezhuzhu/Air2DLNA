@@ -98,16 +98,24 @@ class BridgeController:
     #: 「渲染器没在拉流」多久后触发兜底重建（秒）
     STREAM_STALL_SECONDS = 8.0
     #: AirPlay `pend`（播放流结束）后的过渡窗口（秒）。
-    #: pend 不等价于会话结束：seek / 换曲都可能触发它，立刻 Stop DLNA 会让
-    #: iPhone 拖动进度条后长时间无声。窗口内收到新的流事件就继续播放，
+    #: pend 不等价于会话结束：seek / 换曲 / 暂停都可能触发它，立刻 Stop DLNA 会让
+    #: iPhone 拖动进度条或暂停后长时间无声。窗口内收到新的流事件就继续播放，
     #: 超时才按真正的播放结束处理。
-    PEND_TRANSITION_TIMEOUT_SECONDS = 4.0
+    #: 取 12 秒是为了覆盖「暂停一会儿再继续」——真结束只是晚几秒停，无副作用。
+    PEND_TRANSITION_TIMEOUT_SECONDS = 12.0
     #: Renderer 重建（换 generation / 换 URI）后的最小间隔（秒），防止风暴
     REBUILD_COOLDOWN_SECONDS = 10.0
     #: 诊断日志输出间隔（秒）
     DIAGNOSTIC_INTERVAL_SECONDS = 15.0
-    #: 判定「渲染器时钟速率异常」的相对偏差容差（ΔRelTime / ΔAirPlay）
-    RELTIME_RATE_TOLERANCE = 0.03
+    #: 判定「渲染器时钟速率异常」的相对偏差容差（ΔRelTime / ΔAirPlay）。
+    #: 采样粒度是 1 秒，正常读数本就有 ±0.3 量级抖动，容差太小会被噪声淹没。
+    RELTIME_RATE_TOLERANCE = 0.20
+    #: 速率告警的最小间隔（秒）：真漂移会持续存在，不必每条采样都记
+    RELTIME_RATE_WARN_INTERVAL = 60.0
+    #: ``pbeg`` 时判断「位置是否连续」的容差。AirPlay 2 在暂停恢复与 seek 后
+    #: 都会发 ``pend`` + ``pbeg``；位置连续说明是同一个播放位置的继续，
+    #: 必须沿用当前 generation（重建会让音箱重新缓冲/淡入 = 卡顿甚至停止）。
+    RESUME_POSITION_TOLERANCE_MS = 10000.0
 
     def __init__(self, config, registry, ring: PcmRingBuffer, timeline: AudioTimeline,
                  streams: stream.StreamManager, log=None) -> None:
@@ -149,6 +157,7 @@ class BridgeController:
         self._rel_offset_ms: Optional[float] = None
         self._rel_rate: Optional[float] = None
         self._rel_observed_at = 0.0
+        self._rel_rate_warned_at = 0.0
         self._last_range_info = ""
         self._last_diag_log = 0.0
         #: 每次 SetAVTransportURI 的序号与原因（验收要求：正常播放应该只有 1 次）
@@ -241,7 +250,8 @@ class BridgeController:
             self._handle_pause()
         elif code == "pend":
             # pend = AirPlay **播放流**结束，不能当成整个会话结束：
-            # 拖动进度条、切歌都可能只发 pend 并紧跟新的流事件。
+            # 拖动进度条、切歌、暂停都可能只发 pend 并紧跟新的流事件。
+            log.info("AirPlay 事件: pend（播放流结束）")
             self._handle_play_stream_end("播放流结束")
         elif code == "aend":
             self._handle_session_end("播放结束")
@@ -320,14 +330,50 @@ class BridgeController:
         # pbeg：新的播放会话
         log.info("AirPlay session started")
         self._cancel_transition("pbeg")
-        # 新的播放会话：重建计数与 SetAVTransportURI 计数都归零
-        # （验收标准：一次正常播放全过程只应出现 1 次 SetAVTransportURI）
+
+        if self._can_reuse_generation():
+            # AirPlay 2 在「暂停后恢复」和「seek 之后」都会发 ``pend`` + ``pbeg``。
+            # 此时音频数据是连续的，重建会话只会让音箱重新缓冲并淡入 ——
+            # 真机表现就是卡顿甚至直接停止。这里沿用当前 generation，
+            # 只确保渲染器处于播放状态（Play 是幂等的）。
+            log.info("pbeg：位置连续，沿用当前 DLNA 会话 gen=%d（不重建、不换 URI）",
+                     self.ring.generation)
+            self._set_intent(_MODE_PLAY, self._gen_token)
+            return
+
+        # 真正的新播放位置（首次播放 / 换曲 / seek 到别处）才更换媒体生命周期。
+        # 重建计数与 SetAVTransportURI 计数归零（验收：一次正常播放只应 1 次）。
         self._last_rebuild_at = 0.0
         self._uri_count = 0
         self._begin_new_generation(reason="pbeg", offset_ms=None)
         self._start_dlna_session(reason="pbeg")
 
+    def _can_reuse_generation(self) -> bool:
+        """``pbeg`` 时判断能否沿用当前 DLNA 会话。
+
+        判据是**位置连续性**：用最近一次观测到的
+        ``AirPlay 位置 −（代偏移 + 渲染器 RelTime）`` 偏差。暂停恢复 / seek 之后
+        继续播放时该偏差仍在缓冲延迟量级；而换曲或跳到别处（位置真跳变）会很大。
+        """
+        with self._lock:
+            token = self._gen_token
+            stopped = self.state.state == STOPPED
+        if stopped or not token:
+            return False
+        session = self.streams.get(token)
+        if session is None or session.closed:
+            return False
+        offset = self._rel_offset_ms
+        if offset is not None and abs(offset) > self.RESUME_POSITION_TOLERANCE_MS:
+            log.info("pbeg：位置偏差 %.0f ms（超出连续性容差 %.0f ms），按新的播放位置重建",
+                     offset, self.RESUME_POSITION_TOLERANCE_MS)
+            return False
+        return True
+
     def _handle_pause(self) -> None:
+        """``paus``：暂停。优先用 UPnP Pause（不换代、不 flush，恢复即可继续）。"""
+        log.info("AirPlay 暂停：向渲染器发送 Pause（沿用当前 DLNA 会话 gen=%d）",
+                 self.ring.generation)
         self.timeline.on_pause()
         with self._lock:
             self.state.state = PAUSED
@@ -855,6 +901,7 @@ class BridgeController:
         position = self.timeline.position_ms()
         if rel_time is None or position is None:
             return
+        now = time.monotonic()
         offset = position - (self.timeline.generation_offset_ms + rel_time)
         previous = self._rel_sample
         if previous is not None:
@@ -865,8 +912,11 @@ class BridgeController:
                 self._rel_rate = delta_rel / delta_air
         self._rel_sample = (position, rel_time)
         self._rel_offset_ms = offset
-        self._rel_observed_at = time.monotonic()
-        if self._rel_rate is not None and abs(self._rel_rate - 1.0) > self.RELTIME_RATE_TOLERANCE:
+        self._rel_observed_at = now
+        if (self._rel_rate is not None
+                and abs(self._rel_rate - 1.0) > self.RELTIME_RATE_TOLERANCE
+                and now - self._rel_rate_warned_at >= self.RELTIME_RATE_WARN_INTERVAL):
+            self._rel_rate_warned_at = now
             log.warning(
                 "渲染器时钟速率偏离（ΔRelTime/ΔAirPlay=%.4f，位置偏差=%.0f ms）："
                 "仅记录诊断，不重建会话",

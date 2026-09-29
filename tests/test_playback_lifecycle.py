@@ -244,18 +244,39 @@ class PendTransitionTests(unittest.TestCase):
         self.assertEqual(token_before, controller._gen_token, "不得清空 token")
         self.assertEqual(0, getattr(streams, "close_calls", 0), "不得关闭流")
 
-    def test_new_stream_cancels_transition(self) -> None:
-        controller, _, ring, _, _, streams = _build()
+    def test_pbeg_with_continuous_position_reuses_session(self) -> None:
+        """暂停恢复 / seek 之后位置连续：沿用会话，绝不重建。
+
+        AirPlay 2 在暂停恢复与 seek 之后都会发 ``pend`` + ``pbeg``。若把每个
+        ``pbeg`` 都当新会话来重建，音箱会重新缓冲 → 真机表现为卡顿甚至停止。
+        """
+        controller, _, ring, timeline, _, streams = _build()
         controller._handle_play(False)
         generation_before = ring.generation
+        created_before = len(streams.created)
+        _observe(controller, timeline, 30.0, 27000.0)      # 位置偏差仅约 3 秒（缓冲延迟量级）
         controller._handle_play_stream_end("播放流结束")
 
-        controller._handle_play(False)          # 新的播放流（seek 后 / 切歌后）
+        controller._handle_play(False)                     # 恢复播放
 
         self.assertFalse(controller._awaiting_new_stream, "过渡态应被取消")
-        # pbeg 会换代一次（新的媒体生命周期），但只允许一次
-        self.assertEqual(generation_before + 1, ring.generation)
-        self.assertEqual(2, len(streams.created))
+        self.assertEqual(generation_before, ring.generation, "位置连续时不得换代")
+        self.assertEqual(created_before, len(streams.created), "不得更换流 URI")
+        self.assertEqual(0, controller._uri_count, "不得出现 SetAVTransportURI")
+
+    def test_pbeg_with_jumped_position_rebuilds(self) -> None:
+        """换曲 / 跳到别处：位置真跳变时必须换代（否则音箱还在播旧位置的数据）。"""
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        generation_before = ring.generation
+        created_before = len(streams.created)
+        _observe(controller, timeline, 300.0, 1000.0)      # 渲染器才到 1 秒处 → 跳变 5 分钟
+
+        controller._handle_play(False)
+
+        self.assertEqual(generation_before + 1, ring.generation, "位置跳变应换代")
+        self.assertEqual(created_before + 1, len(streams.created), "应新建流 URI")
+        self.assertEqual("pbeg", controller._last_rebuild_reason)
 
     def test_pcm_resumes_cancel_transition(self) -> None:
         controller, _, _, _, _, _ = _build()
