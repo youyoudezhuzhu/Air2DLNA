@@ -39,6 +39,9 @@ DEFAULTS: dict[str, Any] = {
     "av_offset_ms": 0,
     # 渲染器与内部时间线的漂移阈值（毫秒）
     "drift_threshold_ms": 1500,
+    # 暂停恢复时先写入的静音时长（毫秒）：让渲染器一连上新 URI 就有数据可读。
+    # 默认 0 = 不预填（保持原行为）。仅用于 A/B 测试「预填数据能否缩短出声时间」。
+    "resume_prebuffer_ms": 0,
     # GENA 不可用时的位置轮询间隔（秒）
     "metadata_poll_seconds": 3.0,
     # SSDP 后台重扫间隔（秒）
@@ -62,6 +65,7 @@ EDITABLE_KEYS = {
     "buffer_seconds",
     "av_offset_ms",
     "drift_threshold_ms",
+    "resume_prebuffer_ms",
     "metadata_poll_seconds",
     "rediscover_seconds",
 }

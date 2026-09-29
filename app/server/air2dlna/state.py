@@ -83,6 +83,88 @@ class PlaybackState:
 
 
 @dataclass
+
+class _ResumeTimeline:
+    """一次「暂停恢复」的分段耗时记录（对应 GPT 需求 T0~T14）。
+
+    恢复延迟必须分段测量才能定位瓶颈：是代码、是 HTTP 供给、还是渲染器内部预缓冲。
+    每个标记只记第一次出现的时间（幂等），最后输出一份可直接对照的报告。
+    """
+
+    #: 关键字节里程碑（字节 -> 标记名）
+    BYTE_MARKS = ((100 * 1024, "T10_100kb"), (500 * 1024, "T11_500kb"),
+                  (1024 * 1024, "T12_1mb"), (2 * 1024 * 1024, "T12b_2mb"),
+                  (4 * 1024 * 1024, "T12c_4mb"))
+
+    def __init__(self, byte_rate: int, reason: str = "") -> None:
+        self.t0 = time.monotonic()
+        self.byte_rate = max(1, int(byte_rate))
+        self.reason = reason
+        self.marks: dict[str, float] = {}
+        self.reported = False
+        self.bytes_at: list[tuple[str, int]] = []
+
+    def mark(self, name: str) -> None:
+        """记录一个时间标记（只记第一次）。"""
+        self.marks.setdefault(name, time.monotonic())
+
+    def mark_bytes(self, total_bytes: int) -> None:
+        """按累计发送字节数记录里程碑（跨过阈值时触发）。"""
+        for threshold, name in self.BYTE_MARKS:
+            if total_bytes >= threshold and name not in self.marks:
+                self.marks[name] = time.monotonic()
+                self.bytes_at.append((name, total_bytes))
+
+    def elapsed(self, name: str) -> Optional[float]:
+        started = self.marks.get(name)
+        if started is None:
+            return None
+        return (started - self.t0) * 1000.0
+
+    def segment(self, start: str, end: str) -> Optional[float]:
+        a, b = self.marks.get(start), self.marks.get(end)
+        if a is None or b is None:
+            return None
+        return (b - a) * 1000.0
+
+    def pcm_seconds(self, total_bytes: int) -> float:
+        return total_bytes / float(self.byte_rate)
+
+    def report(self, total_bytes: int = 0, clients: int = 0, generation: int = 0,
+               range_info: str = "", renderer_state: str = "", rel_time_ms: Optional[float] = None) -> str:
+        """输出可直接对照的分段报告（GPT 需求第 9 条）。"""
+
+        def fmt(value: Optional[float]) -> str:
+            return "n/a" if value is None else "%.0f ms" % value
+
+        total = self.elapsed("T14_playing_confirmed") or self.elapsed("T13_reltime_moving")
+        lines = [
+            "=== 暂停恢复耗时报告 (%s) ===" % (self.reason or "resume"),
+            "总耗时 T0→%s = %s" % (
+                "T14" if "T14_playing_confirmed" in self.marks else "T13", fmt(total)),
+            "  代码处理  T0→T5   = %s %s" % (
+                fmt(self.segment("T0_airplay_resume", "T5_seturi_sent")),
+                "(含等待渲染器重连 %s / fallback 决策 %s)" % (
+                    fmt(self.segment("T1_recovery_begin", "T2_fallback_decided")),
+                    fmt(self.segment("T2_fallback_decided", "T3_flush_done")))),
+            "  换代+T3→T4       = %s" % fmt(self.segment("T3_flush_done", "T4_generation_done")),
+            "  SetURI 往返 T5→T7= %s" % fmt(self.segment("T5_seturi_sent", "T7_play_sent")),
+            "  HTTP 建连 T7→T8  = %s" % fmt(self.segment("T7_play_sent", "T8_http_get")),
+            "  首包     T8→T9   = %s" % fmt(self.segment("T8_http_get", "T9_first_data")),
+            "  拉取     T9→T13  = %s" % fmt(self.segment("T9_first_data", "T13_reltime_moving")),
+            "  渲染器内部等待   = %s" % fmt(self.segment("T13_reltime_moving", "T14_playing_confirmed")),
+            "  HTTP 累计 %.0f KB = %.1fs PCM | clients=%d gen=%d | %s | renderer=%s rel_time=%s" % (
+                total_bytes / 1024.0, self.pcm_seconds(total_bytes), clients, generation,
+                range_info or "-", renderer_state or "-",
+                int(rel_time_ms) if rel_time_ms is not None else "-"),
+        ]
+        for name, value in self.bytes_at:
+            lines.append("    里程碑 %s: 累计 %.0f KB (%.1fs PCM) @ %.0f ms" % (
+                name.split("_", 1)[1], value / 1024.0, self.pcm_seconds(value),
+                (self.marks[name] - self.t0) * 1000.0))
+        return "\n".join(lines)
+
+
 class _Intent:
     """收敛线程要达成的目标。"""
 
@@ -197,6 +279,8 @@ class BridgeController:
         #: 方案 A 启动时的 HTTP 连接计数基线（用于判断渲染器是否真的重连了）
         self._recovery_range_baseline = 0
         self._recovery_started_at = 0.0
+        #: 一次暂停恢复的分段耗时记录（GPT 需求 T0~T14）
+        self._resume_timeline: Optional[_ResumeTimeline] = None
         #: 渲染器是否表现出「Stop 后会自己重连 HTTP」的能力。
         #: None = 未知（首次给一个短窗口验证）；False = 已确认不重连 → 下次直接 fallback。
         self._renderer_reconnect_capable: Optional[bool] = None
@@ -353,7 +437,12 @@ class BridgeController:
     # ------------------------------------------------------------- 状态迁移
     def _handle_play(self, is_resume: bool) -> None:
         self._refresh_base_url()
+        # T0：AirPlay 的 pres/pbeg 到达 —— 一次恢复的计时起点
+        self._resume_timeline = _ResumeTimeline(self.ring.byte_rate,
+                                                "resume" if is_resume else "pbeg")
+        self._resume_timeline.mark("T0_airplay_resume")
         if is_resume:
+            self._resume_timeline.mark("T1_recovery_begin")
             self.timeline.on_resume()
             with self._lock:
                 need_rebuild = self._paused_with_stop
@@ -366,6 +455,8 @@ class BridgeController:
                 self._start_dlna_session(reason="resume-rebuild")
             elif token and self._start_pause_recovery():
                 # 方案 A 已启动：等待渲染器自己重连（Range 0 会被映射到暂停位置）
+                if self._resume_timeline is not None:
+                    self._resume_timeline.mark("T2_fallback_decided")
                 return
             elif token and self._pause_recovery_pending:
                 # 有待恢复的暂停，但方案 A 不适用（位置已被缓冲覆盖 / 会话不匹配）。
@@ -374,6 +465,10 @@ class BridgeController:
                 log.info("恢复播放：方案 A 不适用（%s），fallback 换代重建"
                          "（新 generation 的 0 点 = 当前 AirPlay 位置）",
                          self._pause_fallback_reason or "未知")
+                if self._resume_timeline is not None:
+                    self._resume_timeline.reason = "fallback:" + (
+                        self._pause_fallback_reason or "unknown")
+                    self._resume_timeline.mark("T2_fallback_decided")
                 self._clear_pause_recovery("pause-recovery-unsupported")
                 self._begin_new_generation(reason="pause-recovery-unsupported", offset_ms=None)
                 self._start_dlna_session(reason="pause-recovery-unsupported")
@@ -783,12 +878,29 @@ class BridgeController:
             # 等随后的 prgr 用真位置修正（_after_progress → refine_generation_offset）。
             self._pending_reanchor = True
         generation = self.ring.flush()
+        if self._resume_timeline is not None:
+            self._resume_timeline.mark("T3_flush_done")
+        # 可选：恢复时先填一小段静音，让渲染器一连上就有数据可读
+        #（A/B 测试用；默认 0 = 保持原行为，见 config.resume_prebuffer_ms）
+        prebuffer_ms = int(self.config.get("resume_prebuffer_ms") or 0)
+        if prebuffer_ms > 0:
+            try:
+                byte_rate = self.ring.byte_rate
+                frames = int(byte_rate * prebuffer_ms / 1000.0) & ~0x3
+                if frames > 0:
+                    self.ring.append(b"\x00" * frames)
+                    log.info("恢复预填充: 写入 %d ms 静音（%d 字节）供渲染器立即读取",
+                             prebuffer_ms, frames)
+            except Exception:  # noqa: BLE001
+                log.debug("恢复预填充失败", exc_info=True)
         kind, _content_type = "wav", "audio/wav"
         with self._lock:
             self.state.duration_ms = None
             self.state.position_ms = None
             self.state.state = BUFFERING
         self.timeline.begin_generation(generation, offset_ms)
+        if self._resume_timeline is not None:
+            self._resume_timeline.mark("T4_generation_done")
         log.info("音频缓冲换代: gen=%d 原因=%s", generation, reason)
 
     # ------------------------------------------------------------- 意图下发
@@ -819,6 +931,8 @@ class BridgeController:
         )
         duration = self.timeline.duration_ms()
         session = self.streams.new_generation(kind, duration)
+        session.on_bytes = self._note_resume_bytes
+        session.on_connect = self._note_resume_connect
         with self._lock:
             self._gen_token = session.token
             self._paused_with_stop = False
@@ -974,11 +1088,17 @@ class BridgeController:
             "SetAVTransportURI #%d reason=%s generation=%d renderer=%s uri=%s (type=%s)",
             self._uri_count, self._uri_reason, session.generation, record.name, uri,
             session.content_type)
+        if self._resume_timeline is not None:
+            self._resume_timeline.mark("T5_seturi_sent")
         if not self._safe_call(record, client.set_av_transport_uri, "SetAVTransportURI",
                                uri=uri, metadata=metadata):
             return
+        if self._resume_timeline is not None:
+            self._resume_timeline.mark("T6_seturi_returned")
         # 部分渲染器在 SetAVTransportURI 之后需要短暂准备
         time.sleep(0.3)
+        if self._resume_timeline is not None:
+            self._resume_timeline.mark("T7_play_sent")
         if not self._safe_call(record, client.play, "Play"):
             return
         with self._lock:
@@ -1166,6 +1286,8 @@ class BridgeController:
                 position = None
             if position:
                 rel = position.get("rel_time_ms")
+                if rel is not None and float(rel) > 0:
+                    self._maybe_report_resume(self.streams.get(self._renderer_token), float(rel))
                 duration = position.get("duration_ms")
                 self.timeline.update_renderer_position(
                     float(rel) if rel is not None else None
@@ -1206,6 +1328,52 @@ class BridgeController:
         log.warning("渲染器 %.0fs 未拉取音频流（seek/恢复后未重连），重建 DLNA 会话", idle)
         self._begin_new_generation(reason="stalled", offset_ms=None)
         self._start_dlna_session(reason="stalled")
+
+    def _note_resume_connect(self) -> None:
+        """渲染器对新 URI 发起 HTTP GET 的回调（记录 T8）。"""
+        timeline = self._resume_timeline
+        if timeline is not None and not timeline.reported:
+            timeline.mark("T8_http_get")
+
+    def _note_resume_bytes(self, total_bytes: int) -> None:
+        """HTTP 写出字节回调（由 stream.serve 调用）：记录首包时刻与字节里程碑。"""
+        timeline = self._resume_timeline
+        if timeline is None or timeline.reported:
+            return
+        timeline.mark("T9_first_data")
+        timeline.mark_bytes(total_bytes)
+
+    def _maybe_report_resume(self, session=None, rel_time_ms: Optional[float] = None) -> None:
+        """满足确认条件（或超时）后输出一次恢复耗时报告（GPT 需求 T0~T14 / 第 9 条）。"""
+        timeline = self._resume_timeline
+        if timeline is None or timeline.reported:
+            return
+        now = time.monotonic()
+        confirmed = False
+        if rel_time_ms is not None and rel_time_ms > 0:
+            timeline.mark("T13_reltime_moving")
+        if session is not None:
+            served = session.bytes_served
+            moving = "T13_reltime_moving" in timeline.marks
+            if session.clients > 0 and (moving or served >= 500 * 1024):
+                timeline.mark("T14_playing_confirmed")
+                confirmed = True
+        timed_out = (now - timeline.t0) > 20.0
+        if not confirmed and not timed_out:
+            return
+        timeline.reported = True
+        with self._lock:
+            renderer_state = self.state.renderer_state
+        log.info(
+            "%s\n%s",
+            "暂停恢复耗时报告" if confirmed else "暂停恢复耗时报告（未确认出声，仅超时输出）",
+            timeline.report(
+                total_bytes=session.bytes_served if session is not None else 0,
+                clients=session.clients if session is not None else 0,
+                generation=session.generation if session is not None else self.ring.generation,
+                range_info=session.last_range_info if session is not None else "",
+                renderer_state=renderer_state, rel_time_ms=rel_time_ms),
+        )
 
     def _observe_renderer_timeline(self) -> None:
         """把 DLNA 侧的位置信息当作**观测值**：只诊断，绝不驱动重建。

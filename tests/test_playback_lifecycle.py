@@ -628,6 +628,75 @@ class PauseRecoveryTests(unittest.TestCase):
         self.assertFalse(controller._pause_recovery_pending, "seek 应清除暂停恢复状态")
 
 
+class ResumeTimelineTests(unittest.TestCase):
+    """恢复耗时分段测量（GPT 需求 T0~T14）与 prebuffer A/B 支持。"""
+
+    def test_segments_and_report(self) -> None:
+        timeline = state_mod._ResumeTimeline(176400, "test")
+        time.sleep(0.01)
+        timeline.mark("T1_recovery_begin")
+        time.sleep(0.02)
+        timeline.mark("T5_seturi_sent")
+        timeline.mark_bytes(200 * 1024)
+        timeline.mark("T13_reltime_moving")
+        timeline.mark("T14_playing_confirmed")
+
+        report = timeline.report(total_bytes=200 * 1024, clients=1, generation=3,
+                                 range_info="start=0", renderer_state="PLAYING", rel_time_ms=1500)
+
+        self.assertIn("T0→T14", report)
+        self.assertIn("SetURI 往返", report)
+        self.assertIn("200 KB", report)
+        self.assertIn("1.2s PCM", report)          # 200KB / 176400 ≈ 1.16s
+        self.assertGreater(timeline.segment("T1_recovery_begin", "T5_seturi_sent"), 0)
+
+    def test_byte_milestones_recorded_once(self) -> None:
+        timeline = state_mod._ResumeTimeline(176400)
+        timeline.mark_bytes(90 * 1024)
+        self.assertNotIn("T10_100kb", timeline.marks)
+        timeline.mark_bytes(120 * 1024)
+        first = timeline.marks["T10_100kb"]
+        timeline.mark_bytes(5 * 1024 * 1024)
+        self.assertEqual(first, timeline.marks["T10_100kb"], "里程碑只记第一次")
+        self.assertIn("T12c_4mb", timeline.marks)
+
+    def test_controller_marks_t0_on_resume(self) -> None:
+        controller, _, ring, timeline, _, _ = _build()
+        controller._handle_play(False)
+        controller._handle_play(True)              # pres：恢复
+        self.assertIsNotNone(controller._resume_timeline)
+        self.assertIn("T0_airplay_resume", controller._resume_timeline.marks)
+
+    def test_report_emitted_when_playing_confirmed(self) -> None:
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        session = streams.get(controller._gen_token)
+        session.clients = 1
+        session.bytes_served = 600 * 1024              # 已拉取 600KB
+        controller._resume_timeline = state_mod._ResumeTimeline(176400, "test")
+
+        controller._maybe_report_resume(session, rel_time_ms=2000)
+
+        self.assertTrue(controller._resume_timeline.reported)
+        self.assertIn("T14_playing_confirmed", controller._resume_timeline.marks)
+
+    def test_prebuffer_fills_silence_when_configured(self) -> None:
+        controller, config, ring, _, _, _ = _build()
+        config["resume_prebuffer_ms"] = 500
+        controller._handle_play(False)
+        controller._begin_new_generation("prebuffer-test", None)
+
+        served = ring.write_offset
+        self.assertGreaterEqual(served, int(176400 * 0.5), "应写入约 500ms 的静音")
+        self.assertLessEqual(served, int(176400 * 0.6))
+
+    def test_prebuffer_off_by_default(self) -> None:
+        controller, _, ring, _, _, _ = _build()
+        controller._handle_play(False)
+        controller._begin_new_generation("no-prebuffer", None)
+        self.assertEqual(0, ring.write_offset, "默认不应预填任何数据")
+
+
 class StreamRecoveryMappingTests(unittest.TestCase):
     """服务端映射：暂停恢复期间 Range: bytes=0- 从暂停位置读数据（WAV header 语义不变）。"""
 

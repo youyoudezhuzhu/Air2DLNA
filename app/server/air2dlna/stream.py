@@ -21,7 +21,7 @@ import struct
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
 
 from .ringbuffer import BufferOverflow, PcmRingBuffer, StaleGeneration
 
@@ -169,6 +169,10 @@ class StreamSession:
     recovery_byte_offset: Optional[int] = None
     #: 该映射是否已经真正生效过（用于判定恢复成功）
     recovery_applied: bool = False
+    #: 写出字节回调（控制器用它记录恢复耗时的字节里程碑；不参与业务逻辑）
+    on_bytes: Optional[Callable[[int], None]] = None
+    #: 建连回调（控制器用它记录恢复耗时里的 T8：渲染器对新 URI 发起 GET）
+    on_connect: Optional[Callable[[], None]] = None
 
     @property
     def byte_rate(self) -> int:
@@ -305,6 +309,11 @@ class StreamManager:
         )
         with self._lock:
             session.clients += 1
+        if session.on_connect is not None:
+            try:
+                session.on_connect()
+            except Exception:  # noqa: BLE001 - 诊断回调不得影响推流
+                pass
         # 暂停恢复（方案 A）：只在「逻辑 0 点」上做映射，且必须由控制器显式开启。
         # 正常的 Range 请求（含正常播放期间的重连）行为完全不变。
         mapped_offset: Optional[int] = None
@@ -357,6 +366,11 @@ class StreamManager:
                 wfile.write(data)
                 session.bytes_served += len(data)
                 session.last_activity = time.monotonic()
+                if session.on_bytes is not None:
+                    try:
+                        session.on_bytes(session.bytes_served)
+                    except Exception:  # noqa: BLE001 - 诊断回调不得影响推流
+                        pass
 
             # 声明了总长度但实际数据不足：补静音，避免渲染器等到超时
             if (session.total_bytes is not None
