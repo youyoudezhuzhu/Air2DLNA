@@ -146,22 +146,24 @@ build_shairport() {
     git clone --depth 1 https://github.com/mikebrady/shairport-sync.git "$WORK/shairport-sync-src" >/dev/null 2>&1 \
         || die "克隆 shairport-sync 失败"
 
-    # ---- 设备类别：让 iOS 把本机识别为「音响 / 扬声器」而不是通用声音输出 ----
-    # shairport-sync 的两个设备标识是**编译期常量**（没有对应配置项），
-    # 上游源码注释里直接给出了音频接收设备的参考值：
+    # ---- 设备型号：让 iOS 把本机识别为音频接收设备（音响/扬声器）----
+    # `model` 只是型号标识字符串，**不参与能力协商**，可以安全替换；
+    # 上游源码注释里给出了音频接收设备的参考值：
     #     // config.model = strdup("AirPort10,115");
-    #     // features=0x0001C340445D0A00 -- AirPort Express
-    # 这里改为音频接收设备的值（AirPlay 2 / NQPTP / _airplay / _raop 能力位不变，
-    # 仅替换设备型号与 features 位），客户端据此显示为音响类设备。
+    #
+    # ⚠️ 绝对不要动 `config.airplay_features`（能力位）：
+    # 上游注释里的 "AirPort Express" 值 0x0001C340445D0A00 加上元数据位后
+    # 与 HomePod 的 features 完全一致（实测广播为 0x445F8A00,0x1C340），
+    # iOS 会因此按 HomePod 的流程（HomeKit/特定配对）连接，
+    # 而 shairport-sync 并不具备那些能力 —— 真机表现为「搜得到但连不上」。
+    # 1.0.5 踩过这个坑，features 必须保持上游默认值。
     sed -i 's|config.model = strdup("ShairportSync");|config.model = strdup("AirPort10,115");|' \
         "$WORK/shairport-sync-src/shairport.c"
-    sed -i 's|config.airplay_features = 0x00018340405C4A00;|config.airplay_features = 0x0001C340445D0A00;|' \
-        "$WORK/shairport-sync-src/shairport.c"
     grep -q 'AirPort10,115' "$WORK/shairport-sync-src/shairport.c" \
-        || die "设备类别替换失败（model）—— 上游源码结构可能已变更"
-    grep -q '0x0001C340445D0A00' "$WORK/shairport-sync-src/shairport.c" \
-        || die "设备类别替换失败（features）—— 上游源码结构可能已变更"
-    log "已设置 AirPlay 设备类别为音频接收设备（model=AirPort10,115）"
+        || die "设备型号替换失败（model）—— 上游源码结构可能已变更"
+    grep -q 'config.airplay_features = 0x00018340405C4A00;' "$WORK/shairport-sync-src/shairport.c" \
+        || die "features 能力位不是上游默认值 —— 会破坏 AirPlay 连接，已中止"
+    log "已设置 AirPlay 设备型号为音频接收设备（model=AirPort10,115，features 保持上游默认）"
 
     local avahi_libdir="$AVAHI_ROOT/usr/lib/x86_64-linux-gnu"
     (
