@@ -34,12 +34,14 @@ done
 [ -n "$REPO" ] || { echo "必须指定 --repo <owner>/<name>" >&2; exit 2; }
 
 if [ -z "${GH_TOKEN:-}" ]; then
-    if [ -n "$TOKEN_FILE" ] && [ -r "$TOKEN_FILE" ]; then
-        GH_TOKEN="$(tr -d '[:space:]' < "$TOKEN_FILE")"
-    elif [ -r "$HOME/.gh_token" ]; then
-        GH_TOKEN="$(tr -d '[:space:]' < "$HOME/.gh_token")"
-    else
+    for candidate in "$TOKEN_FILE" "$HOME/.gh_token" /root/.gh_token /tmp/gh_token; do
+        [ -n "$candidate" ] && [ -r "$candidate" ] || continue
+        GH_TOKEN="$(tr -d '[:space:]' < "$candidate")"
+        [ -n "$GH_TOKEN" ] && echo "    从 $candidate 读取令牌" && break
+    done
+    if [ -z "${GH_TOKEN:-}" ]; then
         echo "缺少令牌：请设置 GH_TOKEN，或用 --token-file 指定文件。" >&2
+        echo "已尝试：\$HOME/.gh_token ($HOME/.gh_token)、/root/.gh_token、/tmp/gh_token" >&2
         exit 2
     fi
 fi
