@@ -183,23 +183,31 @@ stage_native() {
 
     # 随包分发飞牛可能不含有的库；glibc/libcrypto/libgomp/libuuid/libgpg-error
     # 属于基础系统库，一律使用系统自带（也便于随系统获得安全更新）。
-    # FFmpeg 共享库（LGPL-2.1+）：必须随包分发，且**动态**链接
-    local ff_base ff
+    # FFmpeg 共享库（LGPL-2.1+）：必须随包分发，且**动态**链接。
+    # 步骤：① 复制带完整版本号的真实文件；② 依据上游的 SONAME 符号链接建立同名链接。
+    # 注意：绝不能用推导出的名字去 ln -sf 真实文件（会做出指向自身的软链，把库弄坏——
+    # 这正是 CI 上 "libswresample.so.5: cannot open shared object file" 的根因）。
+    local ff ff_base link target
+    mkdir -p "$lib"
+    rm -f "$lib"/libav*.so* "$lib"/libswresample.so*
     for ff in "$FFMPEG_PREFIX"/lib/libavcodec.so.*.*.* "$FFMPEG_PREFIX"/lib/libavformat.so.*.*.* \
               "$FFMPEG_PREFIX"/lib/libavutil.so.*.*.* "$FFMPEG_PREFIX"/lib/libswresample.so.*.*.*; do
         [ -f "$ff" ] || continue
         ff_base="$(basename "$ff")"
-        cp "$ff" "$lib/$ff_base"
+        cp -f "$ff" "$lib/$ff_base"
         chmod 644 "$lib/$ff_base"
-        # 建立 SONAME 链接，例如 libavcodec.so.61 -> libavcodec.so.61.19.100
-        ln -sf "$ff_base" "$lib/${ff_base%%.so.*}.so.${ff_base#*.so.}" 2>/dev/null || true
     done
-    # 上面的通配展开对 SONAME 不够直观，这里显式重建（更可靠）
-    local soname src_name
-    for soname in "$FFMPEG_PREFIX"/lib/lib*.so.[0-9]*; do
-        [ -L "$soname" ] || continue
-        src_name="$(basename "$(readlink -f "$soname")")"
-        [ -f "$lib/$src_name" ] && ln -sf "$src_name" "$lib/$(basename "$soname")"
+    for link in "$FFMPEG_PREFIX"/lib/libav*.so.[0-9]* "$FFMPEG_PREFIX"/lib/libswresample.so.[0-9]*; do
+        [ -L "$link" ] || continue
+        target="$(readlink -f "$link")"
+        [ -f "$target" ] || continue
+        ln -sf "$(basename "$target")" "$lib/$(basename "$link")"
+    done
+    # 库文件必须存在且不是坏链
+    for link in libavcodec libavformat libavutil libswresample; do
+        if ! compgen -G "$lib/$link.so.[0-9]*" >/dev/null; then
+            die "随包缺少 $link 的共享库（FFmpeg 未正确安装？）"
+        fi
     done
 
     local bundled=(libconfig.so.9 libsoxr.so.0 libplist-2.0.so.3 libpopt.so.0 libsodium.so.23 libgcrypt.so.20)
@@ -214,7 +222,16 @@ stage_native() {
         chmod 644 "$lib/$name"
     done
 
-    log "shairport-sync 能力： $("$bin/shairport-sync" -V 2>&1 | head -1)"
+    # 真正的加载校验：RPATH 指向随包 lib，必须能独立启动
+    local ver
+    if ! ver="$("$bin/shairport-sync" -V 2>&1)"; then
+        echo "--- ldd $bin/shairport-sync ---" >&2
+        ldd "$bin/shairport-sync" >&2 || true
+        echo "--- $lib ---" >&2
+        ls -la "$lib" >&2 || true
+        die "shairport-sync 无法加载（检查随包共享库与 RPATH）: $ver"
+    fi
+    log "shairport-sync 能力： $ver"
     if ! "$bin/shairport-sync" -V 2>&1 | grep -q 'AirPlay2'; then
         die "构建出的 shairport-sync 未启用 AirPlay 2"
     fi
