@@ -111,6 +111,13 @@ class BridgeController:
     REBUILD_COOLDOWN_SECONDS = 10.0
     #: 诊断日志输出间隔（秒）
     DIAGNOSTIC_INTERVAL_SECONDS = 15.0
+    #: 暂停恢复时允许「暂停位置」领先已写入数据的最大秒数。
+    #: AirPlay 上报的位置必然略微领先 FIFO 已写入的数据（真机约 10 毫秒），
+    #: 但领先过多说明位置本身不可信（或数据早已被覆盖），此时不该启用方案 A。
+    PAUSE_RECOVERY_LEAD_ALLOWANCE_SECONDS = 1.0
+    #: 方案 A 启动后，若渲染器在这段时间内没有发起任何新的 HTTP 连接，
+    #: 说明这台固件不会自己重连 —— 提前 fallback，别让用户干等到总超时。
+    PAUSE_RECOVERY_RECONNECT_GRACE_SECONDS = 3.0
     #: 「暂停恢复」（方案 A）等待渲染器自己重连 HTTP 的窗口（秒）。
     #: 真机实测小爱音箱把 UPnP Pause 执行成 Stop，Stop 后只发 Play 会"假播放"
     #: （报告 PLAYING、继续拉流、但无声），必须靠它自己重新 GET（Range: bytes=0-）
@@ -183,6 +190,9 @@ class BridgeController:
         self._paused_generation = 0
         self._paused_at = 0.0
         self._pause_fallback_reason = ""
+        #: 方案 A 启动时的 HTTP 连接计数基线（用于判断渲染器是否真的重连了）
+        self._recovery_range_baseline = 0
+        self._recovery_started_at = 0.0
         #: 最近一次因真实 seek 换代的时刻
         self._handled_seek_at = 0.0
         self._last_range_info = ""
@@ -350,8 +360,19 @@ class BridgeController:
             elif token and self._start_pause_recovery():
                 # 方案 A 已启动：等待渲染器自己重连（Range 0 会被映射到暂停位置）
                 return
+            elif token and self._pause_recovery_pending:
+                # 有待恢复的暂停，但方案 A 不适用（位置已被缓冲覆盖 / 会话不匹配）。
+                # 此时**必须**走 fallback 换代 —— 因为渲染器已 STOPPED，只发 Play
+                # 只会"假播放"（报告 PLAYING、继续拉流、但没有声音）。
+                log.info("恢复播放：方案 A 不适用（%s），fallback 换代重建"
+                         "（新 generation 的 0 点 = 当前 AirPlay 位置）",
+                         self._pause_fallback_reason or "未知")
+                self._clear_pause_recovery("pause-recovery-unsupported")
+                self._begin_new_generation(reason="pause-recovery-unsupported", offset_ms=None)
+                self._start_dlna_session(reason="pause-recovery-unsupported")
             elif token:
-                # 暂停恢复 = 同一个播放位置的继续：只发 Play，**绝不重设 URI**。
+                # 渲染器没有把 Pause 做成 Stop（仍处于 PAUSED）→ 只发 Play 即可续播，
+                # **绝不重设 URI**（重设会让它从资源 0 点重播）。
                 # 真机上渲染器收到 Pause 后会自行转入 STOPPED（诊断日志可见
                 # state=PAUSED renderer=STOPPED）。此时若下发 SetAVTransportURI，
                 # DLNA 语义会让它从该资源**开头**重新播放 —— 这正是「暂停后恢复
@@ -411,7 +432,13 @@ class BridgeController:
         return "ring=[%.1fs,%.1fs]" % (oldest / byte_rate, newest / byte_rate)
 
     def _pause_position_available(self) -> bool:
-        """暂停位置是否仍在环形缓冲窗口内（超出就只能 fallback 换代）。"""
+        """暂停位置的数据是否还在环形缓冲里（已被覆盖就只能 fallback 换代）。
+
+        注意：**不能**要求 ``offset <= write_offset``。AirPlay 上报的播放位置必然
+        略微领先于已写入 FIFO 的数据（真机实测差约 10 毫秒 / 1880 字节），严格比较
+        会把本来可用的暂停恢复误判成"超出窗口"（1.0.10 的 bug）。
+        略微领先没有影响 —— 取用最新的数据即可，见 ``_start_pause_recovery`` 的 clamp。
+        """
         with self._lock:
             offset = self._paused_ring_offset
         if offset is None:
@@ -422,7 +449,8 @@ class BridgeController:
             oldest = max(0, newest - int(self.ring.capacity_seconds * byte_rate))
         except Exception:  # noqa: BLE001
             return False
-        return oldest <= offset <= newest
+        allowance = int(byte_rate * self.PAUSE_RECOVERY_LEAD_ALLOWANCE_SECONDS)
+        return oldest <= offset <= newest + allowance
 
     def _start_pause_recovery(self) -> bool:
         """尝试「方案 A」：保持 generation / URI 不变，让渲染器自己重连 HTTP。
@@ -455,9 +483,20 @@ class BridgeController:
                      self._ring_window_text())
             return False
 
+        try:
+            newest = self.ring.write_offset
+            if offset > newest:
+                # 暂停位置比已写入数据领先几十毫秒 → 退回最新数据处
+                log.info("暂停恢复: 暂停偏移 %d 字节略领先已写入数据 %d 字节，"
+                         "按最新数据处映射", offset, newest)
+                offset = newest
+        except Exception:  # noqa: BLE001
+            pass
         session.recovery_byte_offset = offset
         session.recovery_applied = False
         with self._lock:
+            self._recovery_range_baseline = session.range_requests
+            self._recovery_started_at = time.monotonic()
             self._pause_recovery_deadline = time.monotonic() + self.PAUSE_RECOVERY_TIMEOUT_SECONDS
         log.info(
             "暂停恢复: 启动方案 A（不换代、不换 URI、不 SetAVTransportURI）"
@@ -484,7 +523,24 @@ class BridgeController:
             log.info("暂停恢复: 成功 —— 渲染器已使用 Range 0 映射并在拉流，"
                      "位置即暂停位置，未换代、未换 URI")
             return
-        if time.monotonic() < deadline:
+        now = time.monotonic()
+        # 渲染器若会自己重连，通常在恢复播放后立刻发起。宽限期内一次新连接都没有，
+        # 就说明这台固件不重连 —— 提前 fallback，避免用户白等整个超时窗口。
+        if (session is not None and not session.recovery_applied
+                and session.range_requests <= self._recovery_range_baseline
+                and now - self._recovery_started_at >= self.PAUSE_RECOVERY_RECONNECT_GRACE_SECONDS):
+            self._pause_fallback_reason = "渲染器未重连（固件不自行重建 HTTP）"
+            log.info("暂停恢复: %.1fs 内渲染器没有发起新的 HTTP 连接（%s），"
+                     "判定这台固件不重连，提前 fallback",
+                     now - self._recovery_started_at, self._pause_fallback_reason)
+            with self._lock:
+                self._pause_recovery_deadline = 0.0
+                self._pause_recovery_pending = False
+            session.recovery_byte_offset = None
+            self._begin_new_generation(reason="pause-recovery-unavailable", offset_ms=None)
+            self._start_dlna_session(reason="pause-recovery-unavailable")
+            return
+        if now < deadline:
             return
         with self._lock:
             self._pause_recovery_deadline = 0.0

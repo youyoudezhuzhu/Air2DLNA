@@ -531,6 +531,30 @@ class PauseRecoveryTests(unittest.TestCase):
 
         self.assertFalse(started, "位置超出缓冲窗口时不得启用方案 A")
 
+    def test_pause_position_slightly_ahead_is_still_usable(self) -> None:
+        """AirPlay 位置必然略微领先已写入数据（真机约 10 毫秒）——不得误判为超窗口。
+
+        1.0.10 就是用 ``offset <= write_offset`` 严格比较，导致方案 A 被一路跳过，
+        又落回"只发 Play"的假播放路径。
+        """
+        controller, _, ring, timeline, _, _ = _build()
+        controller._handle_play(False)
+        self._fill(ring, 10.0)
+        _observe(controller, timeline, 10.0, 9000.0)
+
+        controller._handle_pause()
+        with controller._lock:
+            controller._paused_ring_offset = ring.write_offset + 1880   # 领先约 10 毫秒
+
+        self.assertTrue(controller._pause_position_available(),
+                        "略微领先不代表数据不可用")
+        with controller._lock:
+            controller._pause_recovery_pending = True
+        self.assertTrue(controller._start_pause_recovery(), "应正常启动方案 A")
+        session = controller.streams.get(controller._gen_token)
+        self.assertEqual(ring.write_offset, session.recovery_byte_offset,
+                         "映射偏移应被夹到已写入数据处")
+
     def test_watchdog_suppressed_during_recovery(self) -> None:
         controller, _, ring, _, _, streams = _build()
         controller._handle_play(False)
