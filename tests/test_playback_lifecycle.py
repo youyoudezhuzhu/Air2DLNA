@@ -818,6 +818,71 @@ class PauseKeepaliveTests(unittest.TestCase):
         self.assertEqual("current", controller._recovery_mode(), "默认不得启用实验模式")
 
 
+class KeepaliveHealthTests(unittest.TestCase):
+    """GPT Phase 2：keepalive 期间的断流检测 + Renderer Profile 记忆。"""
+
+    def _keepalive(self):
+        controller, config, ring, timeline, record, streams = _build()
+        config["recovery_mode"] = "keepalive"
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        session = streams.get(controller._gen_token)
+        return controller, record, session
+
+    def test_renderer_stopped_during_keepalive_disables_it(self) -> None:
+        controller, record, session = self._keepalive()
+        with controller._lock:
+            controller.state.renderer_state = state_mod._RENDERER_STOPPED
+
+        controller._check_keepalive_health()
+
+        self.assertFalse(controller._silence_active, "应结束 keepalive")
+        self.assertFalse(session.silence_mode)
+        self.assertFalse(controller._keepalive_capable.get(record.udn, True),
+                         "应记入 profile：该设备不能保持 keepalive")
+
+    def test_no_clients_disables_keepalive(self) -> None:
+        controller, record, session = self._keepalive()
+        session.clients = 0
+
+        for _ in range(3):
+            controller._check_keepalive_health()
+
+        self.assertFalse(controller._silence_active)
+        self.assertFalse(controller._keepalive_capable.get(record.udn, True))
+
+    def test_healthy_keepalive_marks_capable(self) -> None:
+        controller, record, session = self._keepalive()
+        session.clients = 1
+        with controller._lock:
+            controller.state.renderer_state = state_mod._RENDERER_PLAYING
+
+        controller._check_keepalive_health()
+
+        self.assertTrue(controller._silence_active, "连接正常时 keepalive 应继续")
+        self.assertTrue(controller._keepalive_capable.get(record.udn, False))
+
+    def test_profile_blocks_keepalive_on_next_pause(self) -> None:
+        controller, record, session = self._keepalive()
+        controller._mark_keepalive_unsupported("测试")
+        session.silence_mode = False
+        controller._silence_active = False
+        calls: list[str] = []
+        record.client.pause = lambda *a, **kw: (calls.append("pause"), True)[1]
+
+        controller._handle_pause()          # 第二次暂停
+
+        self.assertFalse(controller._silence_active, "已被标记不支持时不得再启用 keepalive")
+        # 走 current 方案：向渲染器下发 Pause 意图（由收敛线程执行）
+        self.assertEqual(state_mod._MODE_PAUSE, controller._intent.mode)
+
+    def test_default_unknown_is_allowed(self) -> None:
+        controller, _, _, _, _, _ = _build()
+        controller.config["recovery_mode"] = "keepalive"
+        self.assertTrue(controller._keepalive_allowed(), "未验证过的设备应允许尝试")
+
+
 class SilenceOutputLayerTests(unittest.TestCase):
     """静音只在 HTTP 输出层产生，绝不写入环形缓冲。"""
 

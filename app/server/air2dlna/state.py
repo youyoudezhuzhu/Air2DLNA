@@ -284,6 +284,11 @@ class BridgeController:
         #: 方案 A 启动时的 HTTP 连接计数基线（用于判断渲染器是否真的重连了）
         self._recovery_range_baseline = 0
         self._recovery_started_at = 0.0
+        #: Renderer Profile（按 UDN）：记录该设备是否能可靠保持 keepalive。
+        #: None/缺失 = 未验证；False = 已验证不可用（下次暂停直接走 current）
+        self._keepalive_capable: dict[str, bool] = {}
+        #: keepalive 期间连续没有客户端的采样次数（用于判定断流）
+        self._keepalive_idle_ticks = 0
         #: keepalive 模式：暂停期间渲染器保持 PLAYING，输出层改送静音
         self._silence_active = False
         self._silence_started_at = 0.0
@@ -552,6 +557,7 @@ class BridgeController:
             return False
         self._silence_active = True
         self._silence_started_at = time.monotonic()
+        self._keepalive_idle_ticks = 0
         self._silence_generation = self.ring.generation
         session.silence_mode = True
         with self._lock:
@@ -578,6 +584,55 @@ class BridgeController:
         self._silence_active = False
         log.info("keepalive(方案A): 结束静音（%s），输出层切回真实 PCM（保持 %.1fs，"
                  "期间未对渲染器做任何 UPnP 操作）", reason, elapsed)
+
+    def _keepalive_udn(self) -> str:
+        record = self.registry.selected()
+        return record.udn if record is not None else ""
+
+    def _keepalive_allowed(self) -> bool:
+        """该渲染器是否还有资格尝试 keepalive（Renderer Profile）。"""
+        return self._keepalive_capable.get(self._keepalive_udn(), True) is not False
+
+    def _mark_keepalive_unsupported(self, reason: str) -> None:
+        udn = self._keepalive_udn()
+        if self._keepalive_capable.get(udn) is False:
+            return
+        self._keepalive_capable[udn] = False
+        log.warning("keepalive: 标记渲染器 %s 不支持 keepalive（%s）——"
+                    "后续暂停将直接使用 current 方案", udn or "?", reason)
+
+    def _check_keepalive_health(self) -> None:
+        """keepalive 期间的断流检测（GPT 需求 Phase 2）。
+
+        keepalive 依赖渲染器持续保持 HTTP 连接与播放状态。若它自行断开、
+        停止拉流或转入 STOPPED，就说明该设备不能长期保持 —— 立即结束 keepalive
+        并记入 profile，下一次暂停直接走稳定的 current 方案。
+        """
+        if not self._silence_active:
+            return
+        with self._lock:
+            token = self._gen_token
+            renderer_state = self.state.renderer_state
+        session = self.streams.get(token) if token else None
+        if session is None or session.closed:
+            self._mark_keepalive_unsupported("流会话已失效")
+            self._stop_pause_keepalive("流会话失效")
+            return
+        if renderer_state == _RENDERER_STOPPED:
+            self._mark_keepalive_unsupported("渲染器在暂停期间转入 STOPPED")
+            self._stop_pause_keepalive("渲染器已停止")
+            self._set_intent(_MODE_PAUSE, token)
+            return
+        if session.clients <= 0:
+            self._keepalive_idle_ticks += 1
+            if self._keepalive_idle_ticks >= 3:      # 约 3 个轮询周期（≈9s）
+                self._mark_keepalive_unsupported("渲染器停止拉流")
+                self._stop_pause_keepalive("渲染器停止拉流")
+                self._set_intent(_MODE_PAUSE, token)
+            return
+        self._keepalive_idle_ticks = 0
+        # 连接仍在、渲染器仍在播放 → 该设备可保持 keepalive
+        self._keepalive_capable.setdefault(self._keepalive_udn(), True)
 
     def _keepalive_timeout_seconds(self) -> float:
         try:
@@ -820,6 +875,12 @@ class BridgeController:
             int(position) if position is not None else "-",
             offset if offset is not None else "-", self._ring_window_text())
         mode = self._recovery_mode()
+        if mode in ("keepalive", "auto") and self._keepalive_allowed():
+            pass
+        elif mode in ("keepalive", "auto"):
+            log.info("keepalive: 该渲染器已被标记为不支持 keepalive（断流/超时过），"
+                     "本次直接使用 current 方案")
+            mode = "current"
         if mode in ("keepalive", "auto"):
             # 方案 A：不调用 UPnP Pause（渲染器保持 PLAYING），输出层送静音
             if self._start_pause_keepalive(position, offset):
@@ -1306,7 +1367,8 @@ class BridgeController:
                 self._check_transition_timeout()
                 # 暂停恢复（方案 A）的成功判定 / 超时 fallback
                 self._check_pause_recovery()
-                # keepalive（方案 A'）超时退化
+                # keepalive（方案 A'）断流检测与超时退化（GPT Phase 2）
+                self._check_keepalive_health()
                 self._check_keepalive_timeout()
                 self._log_diagnostics()
             except Exception:  # noqa: BLE001
@@ -1552,7 +1614,8 @@ class BridgeController:
         log.info(
             "诊断: airplay_pos=%s state=%s renderer=%s rel_time=%s offset=%s rate=%s "
             "gen=%s token=%s http_clients=%s bytes_served=%s last_range=%s "
-            "idle=%.1fs uri_count=%d last_rebuild=%s awaiting_new_stream=%s pause_recovery=%s",
+            "idle=%.1fs uri_count=%d last_rebuild=%s awaiting_new_stream=%s pause_recovery=%s "
+            "keepalive_capable=%s",
             int(self.timeline.position_ms()) if self.timeline.position_ms() is not None else "-",
             state_name, renderer_state,
             int(self.timeline.renderer_rel_time_ms) if self.timeline.renderer_rel_time_ms is not None else "-",
@@ -1566,6 +1629,7 @@ class BridgeController:
             self._uri_count, self._last_rebuild_reason or "-", self._awaiting_new_stream,
             ("active" if self._pause_recovery_deadline > 0.0
              else ("armed" if self._pause_recovery_pending else "-")),
+            self._keepalive_capable.get(self._keepalive_udn(), None),
         )
 
     def _sync_positions(self) -> None:
