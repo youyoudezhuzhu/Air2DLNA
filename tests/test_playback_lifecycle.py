@@ -320,9 +320,12 @@ class PendTransitionTests(unittest.TestCase):
         """
         controller, _, ring, _, _, _ = _build()
         controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0) if False else None
+        with controller._lock:                 # 渲染器确实处于暂停（保持连接）
+            controller.state.renderer_state = state_mod._RENDERER_PAUSED
         controller._handle_play(True)          # pres：暂停恢复
 
-        self.assertFalse(controller._intent.set_uri, "暂停恢复不得允许重设 URI")
+        self.assertFalse(controller._intent.set_uri, "原地续播不得允许重设 URI")
         self.assertEqual(state_mod._MODE_PLAY, controller._intent.mode)
 
     def test_reuse_path_never_resets_uri(self) -> None:
@@ -670,8 +673,10 @@ class WorkerThreadIntegrationTests(unittest.TestCase):
 
         self.assertIn("set_av_transport_uri", calls,
                       "收敛线程必须把流交给渲染器（线程若退出则什么都不会发生）")
-        self.assertEqual(1, controller._uri_count)
-        self.assertEqual(1, len(streams.created), "只应创建一条流")
+        # pbeg 与紧随的 pres 都可能换代（渲染器状态未知/STOPPED 时保守重建），
+        # 这里只要求"确实把流交给了渲染器"——即收敛线程活着
+        self.assertGreaterEqual(controller._uri_count, 1)
+        self.assertGreaterEqual(len(streams.created), 1, "应至少创建一条流")
         self.assertEqual(state_mod.PLAYING, controller.state.state)
         self.assertTrue(worker.is_alive() is False or True)
 
@@ -816,6 +821,67 @@ class PauseKeepaliveTests(unittest.TestCase):
     def test_default_mode_is_current(self) -> None:
         controller, _, ring, _, _, _ = _build()
         self.assertEqual("current", controller._recovery_mode(), "默认不得启用实验模式")
+
+
+class ResumeInPlaceGuardTests(unittest.TestCase):
+    """原地续播（只发 Play）的前置条件 —— 真机「seek/快速恢复后无声」的根因。"""
+
+    def test_renderer_stopped_forces_rebuild(self) -> None:
+        # 固件把 Pause 做成 Stop：此时只发 Play 会"假播放"，必须换代
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller.state.renderer_state = state_mod._RENDERER_STOPPED
+        generation_before = ring.generation
+        created_before = len(streams.created)
+
+        controller._handle_play(True)
+
+        self.assertEqual(generation_before + 1, ring.generation, "渲染器已 STOPPED 时必须换代")
+        self.assertEqual(created_before + 1, len(streams.created), "必须换新 URI")
+
+    def test_position_jump_forces_rebuild(self) -> None:
+        # 拖动进度条：渲染器仍是 PAUSED，但曲目位置跳变 → 不能原地续播
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller.state.renderer_state = state_mod._RENDERER_PAUSED
+        # 模拟 seek：AirPlay 恢复后 prgr 报出很远的新位置
+        controller.timeline.on_resume()
+        _set_offset(timeline, 300.0)
+        generation_before = ring.generation
+
+        controller._handle_play(True)
+
+        self.assertEqual(generation_before + 1, ring.generation, "位置跳变时必须换代")
+
+    def test_paused_and_continuous_resumes_in_place(self) -> None:
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller.state.renderer_state = state_mod._RENDERER_PAUSED
+        generation_before = ring.generation
+        created_before = len(streams.created)
+
+        controller._handle_play(True)
+
+        self.assertEqual(generation_before, ring.generation, "暂停且位置连续时不必换代")
+        self.assertEqual(created_before, len(streams.created), "不必换 URI")
+        self.assertFalse(controller._intent.set_uri)
+
+    def test_unknown_renderer_state_is_not_treated_as_paused(self) -> None:
+        controller, _, _, _, _, _ = _build()
+        controller._handle_play(False)
+        with controller._lock:
+            controller.state.renderer_state = "UNKNOWN"
+        self.assertFalse(controller._can_resume_in_place(),
+                         "状态未知时不得假设可原地续播（真机代价是无声）")
 
 
 class KeepaliveHealthTests(unittest.TestCase):

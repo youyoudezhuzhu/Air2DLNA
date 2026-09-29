@@ -498,17 +498,20 @@ class BridgeController:
                 self._clear_pause_recovery("pause-recovery-unsupported")
                 self._begin_new_generation(reason="pause-recovery-unsupported", offset_ms=None)
                 self._start_dlna_session(reason="pause-recovery-unsupported")
-            elif token:
-                # 渲染器没有把 Pause 做成 Stop（仍处于 PAUSED）→ 只发 Play 即可续播，
+            elif token and self._can_resume_in_place():
+                # 渲染器确实处于暂停且位置连续 → 只发 Play 续播，
                 # **绝不重设 URI**（重设会让它从资源 0 点重播）。
-                # 真机上渲染器收到 Pause 后会自行转入 STOPPED（诊断日志可见
-                # state=PAUSED renderer=STOPPED）。此时若下发 SetAVTransportURI，
-                # DLNA 语义会让它从该资源**开头**重新播放 —— 这正是「暂停后恢复
-                # 变成从头播放」的直接原因（1.0.8 只改了 pbeg 分支，而真机走的是
-                # 这里的 pres/resume 分支）。
-                log.info("恢复播放：向渲染器发送 Play（沿用当前 DLNA 会话 gen=%d，不重设 URI）",
+                log.info("恢复播放：渲染器处于暂停且位置连续，只发送 Play（沿用 gen=%d，不重设 URI）",
                          self.ring.generation)
                 self._set_intent(_MODE_PLAY, token, set_uri=False)
+            elif token:
+                # 其它情况（渲染器其实已 STOPPED、或位置跳变/seek）：
+                # 只发 Play 会"假播放"（无声），必须换代重建。
+                log.info("恢复播放：渲染器状态=%s 不满足原地续播（或位置跳变），"
+                         "换代重建（新 generation 的 0 点 = 当前 AirPlay 位置）",
+                         self.state.renderer_state)
+                self._begin_new_generation(reason="resume-rebuild", offset_ms=None)
+                self._start_dlna_session(reason="resume-rebuild")
             else:
                 self._start_dlna_session(reason="resume")
             return
@@ -533,6 +536,29 @@ class BridgeController:
         self._uri_count = 0
         self._begin_new_generation(reason="pbeg", offset_ms=None)
         self._start_dlna_session(reason="pbeg")
+
+    def _can_resume_in_place(self) -> bool:
+        """能否原地续播（只发 Play、不换代、不重设 URI）。
+
+        必须同时满足：
+
+        1. **渲染器确实处于 PAUSED** —— 真机上固件把 ``Pause`` 做成 ``Stop``，
+           此时只发 ``Play`` 会"假播放"（报告 PLAYING、继续拉流、但无声）。
+        2. **曲目位置连续** —— 位置跳变意味着用户 seek 到了别处，必须换代重建。
+
+        真机事故：快速「暂停→恢复」或拖动进度条时，轮询还没来得及发现渲染器
+        已 STOPPED，旧逻辑只看"有 token"就原地续播 → 无声、且再也恢复不了。
+        """
+        if self.state.renderer_state != _RENDERER_PAUSED:
+            return False
+        current = self.timeline.position_ms()
+        baseline = self._position_at_stream_boundary
+        if current is not None and baseline is not None:
+            delta = abs(current - baseline)
+            if delta > self.RESUME_POSITION_TOLERANCE_MS:
+                log.info("恢复播放：曲目位置跳变 %.0f ms（可能是 seek），不能原地续播", delta)
+                return False
+        return True
 
     def _recovery_mode(self) -> str:
         """暂停恢复策略（实验开关）：current / keepalive / prewarm / auto。"""
