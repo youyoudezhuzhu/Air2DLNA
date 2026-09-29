@@ -1,0 +1,275 @@
+#!/bin/bash
+# AirPlay 2 → DLNA 桥接 —— 飞牛应用生命周期脚本
+#
+#   main start | stop | status
+#
+# 进程模型（最小权限，见 TECHNICAL_DESIGN 第 15 / 18 节）：
+#
+#   root  ├─ nqptp            （UDP 319/320，特权端口，单一职责）
+#         └─ nqptp-watchdog   （看护 nqptp，纯 shell 循环）
+#
+#   应用用户 ├─ shairport-sync （AirPlay 2 接收；解析不可信网络数据 → 必须降权）
+#            └─ bridge.py      （DLNA 控制 + Web UI / REST API + 实时 PCM 流）
+#
+# 生命周期脚本由飞牛以 root 运行；启动后立即把真正处理网络数据的进程
+# 通过 setpriv/runuser 降权到应用用户。
+
+set -u
+
+APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
+HOME_DIR="${TRIM_PKGHOME:-/vol1/@apphome/airplay2dlna}"
+PORT="${TRIM_SERVICE_PORT:-8788}"
+RUN_USER="${TRIM_USERNAME:-airplay2dlna}"
+APPVER="${TRIM_APPVER:-1.0.0}"
+
+MAIN_LOG="$VAR/main.log"
+BRIDGE_PID="$VAR/app.pid"
+NQPTP_PID="$VAR/nqptp.pid"
+SHAIRPORT_PID="$VAR/shairport-sync.pid"
+WATCHDOG_PID="$VAR/nqptp-watchdog.pid"
+STOP_FILE="$VAR/nqptp-watchdog.stop"
+
+BRIDGE="$APP/server/bridge.py"
+UI_DIR="$APP/ui"
+BIN_DIR="$APP/server/bin"
+WATCHDOG="$APP/server/nqptp-watchdog.sh"
+
+# python312 是 manifest 中声明的依赖运行时
+PYTHON="/var/apps/python312/target/bin/python3"
+if [ ! -x "$PYTHON" ]; then
+    PYTHON="$(command -v python3 || true)"
+fi
+
+mkdir -p "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
+
+log_msg() {
+    echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$MAIN_LOG"
+}
+
+fail() {
+    log_msg "ERROR: $*"
+    echo "$*" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+    exit 1
+}
+
+check_pid() {
+    local pid="$1"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+read_pid() {
+    local file="$1"
+    [ -r "$file" ] || return 1
+    head -n 1 "$file" 2>/dev/null | tr -d '[:space:]'
+}
+
+# 以应用用户运行命令（降权）。优先 setpriv，其次 runuser，最后 su。
+run_as_app_user() {
+    if [ -z "$RUN_USER" ] || [ "$RUN_USER" = "root" ] || ! id -u "$RUN_USER" >/dev/null 2>&1; then
+        exec "$@"
+    fi
+    local uid gid
+    uid="$(id -u "$RUN_USER")"
+    gid="$(id -g "$RUN_USER")"
+    if command -v setpriv >/dev/null 2>&1; then
+        exec setpriv --reuid="$uid" --regid="$gid" --clear-groups -- "$@"
+    fi
+    if command -v runuser >/dev/null 2>&1; then
+        exec runuser -u "$RUN_USER" -- "$@"
+    fi
+    log_msg "WARN: 未找到 setpriv/runuser，将以当前用户启动：$*"
+    exec "$@"
+}
+
+# ---------------------------------------------------------------- 前置检查
+preflight() {
+    [ -x "$PYTHON" ] || fail "缺少 Python 运行时（python312）：$PYTHON"
+    [ -f "$BRIDGE" ] || fail "缺少桥接主程序：$BRIDGE"
+    [ -x "$BIN_DIR/shairport-sync" ] || fail "缺少 AirPlay 2 接收器：$BIN_DIR/shairport-sync"
+    [ -x "$BIN_DIR/nqptp" ] || fail "缺少 PTP 时钟守护进程：$BIN_DIR/nqptp"
+    [ -f "$UI_DIR/index.html" ] || fail "缺少 Web UI：$UI_DIR/index.html"
+    # port 由飞牛预检（manifest checkport=true），这里仅做兜底提示
+    case "$PORT" in
+        ''|*[!0-9]*) fail "无效的服务端口：$PORT" ;;
+    esac
+    if [ "$PORT" -lt 1024 ]; then
+        fail "服务端口必须 >= 1024（当前 $PORT）"
+    fi
+}
+
+# ---------------------------------------------------------------- nqptp
+start_nqptp_watchdog() {
+    local pid
+    pid="$(read_pid "$WATCHDOG_PID" || true)"
+    if check_pid "$pid"; then
+        return 0
+    fi
+    [ -x "$WATCHDOG" ] || fail "缺少 nqptp 看护脚本：$WATCHDOG"
+    rm -f "$STOP_FILE"
+    chmod +x "$WATCHDOG" 2>/dev/null
+    TRIM_PKGVAR="$VAR" TRIM_APPDEST="$APP" nohup "$WATCHDOG" >/dev/null 2>&1 &
+    echo "$!" > "$WATCHDOG_PID"
+    log_msg "nqptp 看护脚本已启动 (pid=$!)"
+    sleep 1
+}
+
+stop_nqptp_watchdog() {
+    # 先写停止标志，让看护脚本自行优雅退出并停掉 nqptp
+    touch "$STOP_FILE" 2>/dev/null
+    local pid
+    pid="$(read_pid "$WATCHDOG_PID" || true)"
+    if check_pid "$pid"; then
+        local count=0
+        while check_pid "$pid" && [ "$count" -lt 15 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if check_pid "$pid"; then
+            kill -TERM "$pid" 2>/dev/null
+            sleep 1
+            kill -KILL "$pid" 2>/dev/null
+        fi
+    fi
+    rm -f "$WATCHDOG_PID" "$STOP_FILE"
+    # 兜底：只按记录到的 PID 终止，绝不用 pkill -f。
+    # 原因：`pkill -f <二进制路径>` 会匹配到任何命令行里含有该路径的进程
+    # （包括运维人员的 shell、日志跟踪命令等），属于真实存在的误杀风险。
+    local npid
+    npid="$(read_pid "$NQPTP_PID" || true)"
+    if check_pid "$npid"; then
+        kill -TERM "$npid" 2>/dev/null
+        sleep 1
+        kill -KILL "$npid" 2>/dev/null
+    fi
+    rm -f "$NQPTP_PID"
+}
+
+# ---------------------------------------------------------------- bridge
+start_bridge() {
+    local pid
+    pid="$(read_pid "$BRIDGE_PID" || true)"
+    if check_pid "$pid"; then
+        return 0
+    fi
+    rm -f "$BRIDGE_PID"
+
+    # 运行目录归属应用用户（配置目录同理），确保降权后可写
+    if id -u "$RUN_USER" >/dev/null 2>&1; then
+        chown -R "$RUN_USER" "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
+        chmod 750 "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
+    fi
+
+    : >> "$MAIN_LOG"
+    # 注意：不能用 `nohup run_as_app_user ...` —— nohup 是外部命令，看不见 shell 函数。
+    # 这里在子 shell 内直接调用函数；函数末尾用 exec 替换自身，因此 $! 就是最终 PID。
+    (
+        exec </dev/null
+        exec >>"$MAIN_LOG" 2>&1
+        run_as_app_user "$PYTHON" "$BRIDGE" \
+            --config-dir "$ETC" \
+            --var-dir "$VAR" \
+            --ui-dir "$UI_DIR" \
+            --bin-dir "$BIN_DIR" \
+            --version "$APPVER"
+    ) &
+    echo "$!" > "$BRIDGE_PID"
+    log_msg "bridge.py 已启动 (pid=$!，运行用户=$RUN_USER)"
+    sleep 1
+}
+
+health_probe() {
+    # 在子 shell 中完成 TCP 连接与请求：bash 在 /dev/tcp 连接失败时会向 stderr
+    # 打印 "Connection refused"，放在子 shell 里统一丢弃，避免污染应用日志。
+    ( exec 3<>"/dev/tcp/127.0.0.1/$PORT" || exit 1
+      printf 'GET /api/health HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n' >&3
+      head -c 400 <&3
+    ) 2>/dev/null
+}
+
+health_check() {
+    local i
+    for i in $(seq 1 40); do
+        if ! check_pid "$(read_pid "$BRIDGE_PID" || true)"; then
+            return 1
+        fi
+        if health_probe | grep -q '"ok"'; then
+            return 0
+        fi
+        sleep 0.5
+    done
+    return 1
+}
+
+stop_bridge() {
+    local pid
+    pid="$(read_pid "$BRIDGE_PID" || true)"
+    if check_pid "$pid"; then
+        log_msg "正在停止 bridge.py (pid=$pid)"
+        kill -TERM "$pid" 2>/dev/null
+        local count=0
+        while check_pid "$pid" && [ "$count" -lt 15 ]; do
+            sleep 1
+            count=$((count + 1))
+        done
+        if check_pid "$pid"; then
+            log_msg "bridge.py 未及时退出，强制结束"
+            kill -KILL "$pid" 2>/dev/null
+        fi
+    fi
+    # 兜底清理子进程：shairport-sync 由 bridge 监管，正常已随之退出。
+    # 若 bridge 被强杀而未能回收子进程，则按 bridge 记录的 PID 文件精确终止。
+    local spid
+    spid="$(read_pid "$SHAIRPORT_PID" || true)"
+    if check_pid "$spid"; then
+        log_msg "清理遗留的 shairport-sync (pid=$spid)"
+        kill -TERM "$spid" 2>/dev/null
+        sleep 1
+        kill -KILL "$spid" 2>/dev/null
+    fi
+    rm -f "$BRIDGE_PID" "$SHAIRPORT_PID"
+}
+
+# ---------------------------------------------------------------- 命令
+do_start() {
+    preflight
+    if check_pid "$(read_pid "$BRIDGE_PID" || true)" && health_check; then
+        log_msg "服务已在运行，跳过启动"
+        return 0
+    fi
+    log_msg "开始启动 AirPlay 2 → DLNA 桥接"
+    start_nqptp_watchdog
+    start_bridge
+    if ! health_check; then
+        log_msg "启动健康检查失败，正在回滚"
+        stop_bridge
+        stop_nqptp_watchdog
+        fail "服务启动失败：Web 服务未在 ${PORT} 端口就绪，请查看 $MAIN_LOG"
+    fi
+    log_msg "启动完成"
+    return 0
+}
+
+do_stop() {
+    log_msg "开始停止 AirPlay 2 → DLNA 桥接"
+    stop_bridge
+    stop_nqptp_watchdog
+    log_msg "停止完成"
+    return 0
+}
+
+do_status() {
+    if check_pid "$(read_pid "$BRIDGE_PID" || true)"; then
+        exit 0
+    fi
+    rm -f "$BRIDGE_PID"
+    exit 3
+}
+
+case "${1:-}" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    status)  do_status ;;
+    *)       exit 1 ;;
+esac

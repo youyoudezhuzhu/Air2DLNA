@@ -1,0 +1,22 @@
+#!/bin/bash
+# 升级后：幂等迁移配置（只增不删），并按需重启
+set -u
+APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
+RUN_USER="${TRIM_USERNAME:-airplay2dlna}"
+PYTHON="/var/apps/python312/target/bin/python3"
+LOGF="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+
+chmod +x "$APP"/server/bin/* "$APP"/server/*.sh "$APP"/server/*.py "$APP"/cmd/* 2>/dev/null
+chmod -R a+rX "$APP" 2>/dev/null
+"$PYTHON" "$APP/server/config_cli.py" --config-dir "$ETC" migrate || {
+    echo "配置迁移失败，已保留原配置" > "$LOGF"
+}
+# 清理旧运行期的 FIFO 与 PID，避免跨版本残留
+rm -f "$VAR"/audio.fifo "$VAR"/metadata.fifo "$VAR"/*.pid "$VAR"/nqptp-watchdog.stop 2>/dev/null
+if id -u "$RUN_USER" >/dev/null 2>&1; then
+    chown -R "$RUN_USER" "$VAR" "$ETC" 2>/dev/null
+fi
+"$APP/cmd/main" start >/dev/null 2>&1 || true
+exit 0

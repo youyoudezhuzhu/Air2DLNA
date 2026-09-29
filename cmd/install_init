@@ -1,0 +1,21 @@
+#!/bin/bash
+# 安装前检查：必须存在 python312 运行时；架构必须为 x86 家族。
+#
+# 注意：飞牛上 TRIM_SYS_ARCH 的实际取值是 x86 / amd64 / x86_64 之一，
+# 不能只判等 x86_64，否则会误拦截安装。
+set -u
+LOGF="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+
+if [ ! -x "/var/apps/python312/target/bin/python3" ]; then
+    echo "缺少 python312 运行时，无法安装本应用。请先在应用中心安装 Python 3.12。" > "$LOGF"
+    exit 1
+fi
+
+ARCH="${TRIM_SYS_ARCH:-x86_64}"
+case "$ARCH" in
+    arm*|aarch64*|arm64*)
+        echo "本应用当前只提供 x86-64 版本（当前架构：${ARCH}）。" > "$LOGF"
+        exit 1
+        ;;
+esac
+exit 0

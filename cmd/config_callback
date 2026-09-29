@@ -1,0 +1,22 @@
+#!/bin/bash
+# 应用设置变更后：写入新配置并重启
+set -u
+APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
+PYTHON="/var/apps/python312/target/bin/python3"
+LOGF="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+
+# 必须用数组传参：向导值可能含空格（例如 "Feiniu AirPlay"），
+# 用未加引号的 $ARGS 会被 word-splitting 拆开，导致配置写入失败。
+ARGS=()
+[ -n "${wizard_airplay_name:-}" ] && ARGS+=("wizard_airplay_name=${wizard_airplay_name}")
+[ -n "${wizard_log_level:-}" ] && ARGS+=("wizard_log_level=${wizard_log_level}")
+if [ "${#ARGS[@]}" -gt 0 ]; then
+    if ! "$PYTHON" "$APP/server/config_cli.py" --config-dir "$ETC" set "${ARGS[@]}"; then
+        echo "配置校验失败，已保留原配置" > "$LOGF"
+        "$APP/cmd/main" start >/dev/null 2>&1 || true
+        exit 1
+    fi
+fi
+"$APP/cmd/main" start >/dev/null 2>&1 || true
+exit 0

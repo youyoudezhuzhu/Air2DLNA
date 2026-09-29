@@ -1,0 +1,5 @@
+#!/bin/bash
+# 应用设置变更前：停服，确保新配置在干净状态下生效
+set -u
+"${TRIM_APPDEST:-/var/apps/airplay2dlna/target}/cmd/main" stop >/dev/null 2>&1 || true
+exit 0

@@ -1,0 +1,38 @@
+[
+    {
+        "stepTitle": "AirPlay 音箱",
+        "items": [
+            {
+                "type": "text",
+                "field": "wizard_airplay_name",
+                "label": "AirPlay 音箱名称",
+                "initValue": "Feiniu AirPlay",
+                "helpText": "这个名称会显示在 iPhone / iPad / Mac 的 AirPlay 设备列表中。它与 DLNA 音响自身的名称完全独立，之后可随时在应用界面修改。",
+                "rules": [
+                    { "required": true, "message": "请填写 AirPlay 音箱名称" },
+                    { "pattern": "^[^\"\\\\]{1,50}$", "message": "不能包含引号或反斜杠，长度不超过 50" }
+                ]
+            }
+        ]
+    },
+    {
+        "stepTitle": "日志级别",
+        "items": [
+            {
+                "type": "radio",
+                "field": "wizard_log_level",
+                "label": "日志详细程度",
+                "initValue": "info",
+                "options": [
+                    { "label": "常规（推荐）", "value": "info" },
+                    { "label": "详细（排查问题用）", "value": "debug" },
+                    { "label": "仅警告与错误", "value": "warn" }
+                ]
+            },
+            {
+                "type": "tips",
+                "helpText": "安装完成后：打开应用 → 搜索 DLNA 设备 → 选择你的音响 → 保存。之后在 Apple 设备的控制中心里选择上面的 AirPlay 名称即可播放。"
+            }
+        ]
+    }
+]

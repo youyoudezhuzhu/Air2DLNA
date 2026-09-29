@@ -1,0 +1,23 @@
+#!/bin/bash
+# 卸载前：停服，并按记录到的 PID 精确清理遗留进程。
+#
+# 刻意不使用 `pkill -f <二进制路径>`：该写法会匹配任何命令行中含有该路径的进程
+# （例如运维人员的 shell 或日志跟踪命令），存在误杀风险。
+set -u
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
+APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
+
+"$APP/cmd/main" stop >/dev/null 2>&1 || true
+
+for name in nqptp shairport-sync; do
+    pidfile="$VAR/$name.pid"
+    [ -r "$pidfile" ] || continue
+    pid="$(head -n 1 "$pidfile" 2>/dev/null | tr -d '[:space:]')"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        kill -TERM "$pid" 2>/dev/null
+        sleep 1
+        kill -KILL "$pid" 2>/dev/null
+    fi
+    rm -f "$pidfile"
+done
+exit 0

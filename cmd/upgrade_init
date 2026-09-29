@@ -1,0 +1,5 @@
+#!/bin/bash
+# 升级前：幂等停服，避免旧代码占着端口
+set -u
+"${TRIM_APPDEST:-/var/apps/airplay2dlna/target}/cmd/main" stop >/dev/null 2>&1 || true
+exit 0

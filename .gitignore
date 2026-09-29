@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# 构建产物
+*.fpk
+build/
+dist/
+.vendor/
+
+# 本地开发
+.trim-cli/
+*.log

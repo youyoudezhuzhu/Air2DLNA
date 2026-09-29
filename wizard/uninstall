@@ -1,0 +1,24 @@
+[
+    {
+        "stepTitle": "确认卸载",
+        "items": [
+            {
+                "type": "tips",
+                "helpText": "您即将卸载 AirPlay 2 → DLNA 桥接。请选择如何处理应用配置与日志："
+            },
+            {
+                "type": "radio",
+                "field": "wizard_data_action",
+                "label": "数据保留选项",
+                "initValue": "keep",
+                "options": [
+                    { "label": "保留配置与日志（推荐）- 重新安装后设置仍在", "value": "keep" },
+                    { "label": "删除全部配置与日志 - 不可恢复", "value": "delete" }
+                ],
+                "rules": [
+                    { "required": true, "message": "请选择数据保留选项" }
+                ]
+            }
+        ]
+    }
+]

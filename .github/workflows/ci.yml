@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # 纯 Python 测试：秒级完成，无需编译原生组件
+  tests:
+    name: 单元测试 + 端到端集成测试
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 检查 Python 版本
+        run: python3 --version
+
+      - name: 语法检查（全部 Python 模块）
+        run: python3 -m compileall -q app/server
+
+      - name: 单元测试
+        run: python3 -m unittest discover -s tests -v
+
+      - name: 端到端集成测试（真实 SSDP + SOAP + HTTP 拉流）
+        # 会启动 tests/fake_renderer.py：真监听 SSDP 1900、真处理 SOAP、真拉 PCM 流
+        run: python3 tests/integration_test.py
+
+      - name: Shell 脚本语法检查
+        run: |
+          for f in cmd/* app/server/*.sh scripts/*.sh; do
+            bash -n "$f" || exit 1
+          done
+
+      - name: JSON 配置可解析
+        run: |
+          python3 - <<'PY'
+          import json
+          for f in ["config/privilege", "config/resource", "app/ui/config",
+                    "wizard/install", "wizard/config", "wizard/uninstall"]:
+              json.load(open(f, encoding="utf-8"))
+              print("OK", f)
+          PY
+
+  # 原生组件构建：验证 build.sh 在干净环境里可复现（不含 FPK 打包，CI 无 fnpack）
+  native:
+    name: 原生组件构建（shairport-sync / NQPTP / FFmpeg）
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装构建依赖
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential autoconf automake libtool \
+            pkg-config git libpopt-dev libconfig-dev libssl-dev libsoxr-dev \
+            libplist-dev libsodium-dev libgcrypt20-dev uuid-dev libplist-utils xxd
+
+      - name: 构建原生组件
+        run: sudo -E ./scripts/build.sh --no-pack
+
+      - name: 断言 AirPlay 2 + Avahi 已启用
+        run: |
+          V=$(./app/server/bin/shairport-sync -V)
+          echo "$V"
+          echo "$V" | grep -q AirPlay2 || { echo "::error::未启用 AirPlay 2"; exit 1; }
+          echo "$V" | grep -q Avahi    || { echo "::error::未使用 Avahi（_airplay._tcp 无法注册）"; exit 1; }
+          ldd ./app/server/bin/shairport-sync | grep -q libavcodec \
+            || { echo "::error::FFmpeg 未动态链接（LGPL 合规要求）"; exit 1; }
+
+      - name: 上传原生二进制
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-components
+          path: |
+            app/server/bin/
+            app/server/lib/
+          if-no-files-found: error

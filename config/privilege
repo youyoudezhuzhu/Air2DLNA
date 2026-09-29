@@ -1,0 +1,8 @@
+{
+    "defaults":
+    {
+        "run-as": "root"
+    },
+    "username": "airplay2dlna",
+    "groupname": "airplay2dlna"
+}

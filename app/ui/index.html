@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="referrer" content="same-origin">
+<title>AirPlay 2 → DLNA 桥接</title>
+<link rel="icon" href="images/icon_64.png">
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<div class="wrap">
+
+  <!-- 断线提示条：任一状态请求失败时显示，恢复后自动隐藏 -->
+  <div id="net-banner" class="banner banner-error" role="alert" hidden>
+    <span class="banner-title">无法连接后端服务</span>
+    <span id="net-banner-msg" class="banner-msg">正在重试…</span>
+  </div>
+
+  <!-- ===== 1. 头部 ===== -->
+  <header class="card app-header">
+    <div class="app-header-main">
+      <img class="app-logo" src="images/icon_64.png" alt="" width="40" height="40">
+      <div class="app-header-text">
+        <h1>AirPlay 2 → DLNA</h1>
+        <p class="subtitle">把局域网里的 DLNA 音响变成 AirPlay 2 音箱</p>
+      </div>
+    </div>
+    <div class="pills">
+      <span id="pill-airplay" class="pill pill-unknown">AirPlay：检测中</span>
+      <span id="pill-mdns" class="pill pill-unknown">mDNS：检测中</span>
+      <span id="pill-addr" class="pill pill-muted">—</span>
+    </div>
+  </header>
+
+  <!-- ===== 2. AirPlay 音箱名称 ===== -->
+  <section class="card">
+    <h2>AirPlay 音箱名称</h2>
+    <div class="row">
+      <input id="airplay-name" class="input" type="text" maxlength="63"
+             placeholder="Feiniu AirPlay" autocomplete="off" spellcheck="false"
+             aria-label="AirPlay 音箱名称">
+      <button id="btn-save-name" class="btn btn-primary" type="button">保存</button>
+    </div>
+    <p id="name-msg" class="msg" role="status" aria-live="polite"></p>
+    <p class="hint">默认名称：<code>Feiniu AirPlay</code>。该名称是 iPhone / iPad 在 AirPlay 列表中看到的设备名。</p>
+    <p class="hint">注意：重命名<strong>不会</strong>改变所选 DLNA 播放设备，也不会修改 DLNA 音响自身的名称。</p>
+  </section>
+
+  <!-- ===== 3. DLNA 播放设备 ===== -->
+  <section class="card">
+    <h2>DLNA 播放设备</h2>
+    <div class="row row-actions">
+      <button id="btn-discover" class="btn btn-primary" type="button">搜索设备</button>
+      <button id="btn-refresh" class="btn" type="button">刷新</button>
+      <span id="discover-status" class="discover-status" hidden>
+        <span class="spinner" aria-hidden="true"></span>正在搜索…
+      </span>
+    </div>
+    <p id="renderer-msg" class="msg" role="status" aria-live="polite"></p>
+
+    <!-- 已选设备离线警告 -->
+    <div id="renderer-warn" class="warn-box" hidden>
+      <strong>DLNA Renderer：离线</strong>
+      <span id="renderer-warn-detail" class="warn-detail"></span>
+    </div>
+
+    <ul id="renderer-list" class="renderer-list" role="radiogroup" aria-label="DLNA 播放设备列表"></ul>
+    <p id="renderer-empty" class="empty" hidden>未发现 DLNA 设备，点击「搜索设备」开始扫描。</p>
+    <p class="hint">离线设备仍会显示并可点击选择，但桥接不会自动切换设备。</p>
+  </section>
+
+  <!-- ===== 4. 当前播放 ===== -->
+  <section class="card">
+    <h2>当前播放</h2>
+    <div class="now-playing">
+      <div class="artwork-box">
+        <img id="artwork" class="artwork" alt="专辑封面" hidden>
+        <div id="artwork-placeholder" class="artwork artwork-placeholder" aria-hidden="true">♪</div>
+      </div>
+      <div class="track">
+        <span id="play-state" class="badge badge-idle">已停止</span>
+        <p id="track-title" class="track-title">未在播放</p>
+        <p id="track-artist" class="track-sub">—</p>
+        <p id="track-album" class="track-sub">—</p>
+
+        <div class="progress-wrap">
+          <div id="progress-bar" class="progress" role="progressbar"
+               aria-label="播放进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+            <div id="progress-fill" class="progress-fill"></div>
+          </div>
+          <div class="progress-labels">
+            <span id="time-current" class="mono">--:--</span>
+            <span id="time-total" class="mono">--:--</span>
+          </div>
+        </div>
+
+        <div class="volume-row">
+          <span class="small-label">音量</span>
+          <input id="volume" class="range" type="range" min="0" max="100" step="1" value="0"
+                 disabled aria-label="音量（仅供显示）">
+          <span id="volume-text" class="mono volume-text">--</span>
+        </div>
+
+        <p class="hint">音量由 AirPlay 发送端控制，此处仅作显示。</p>
+        <p class="hint">输出设备：<span id="play-renderer">—</span></p>
+        <p class="hint mono">音频格式：<span id="audio-format">—</span></p>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===== 5. 服务信息 ===== -->
+  <section class="card">
+    <h2>服务信息</h2>
+    <dl class="kv">
+      <div class="kv-row"><dt>版本</dt><dd id="info-version">—</dd></div>
+      <div class="kv-row"><dt>运行时长</dt><dd id="info-uptime">—</dd></div>
+      <div class="kv-row"><dt>RTSP 端口</dt><dd id="info-rtsp" class="mono">—</dd></div>
+      <div class="kv-row"><dt>HTTP 端口</dt><dd id="info-http" class="mono">—</dd></div>
+      <div class="kv-row"><dt>AirPlay 客户端</dt><dd id="info-client">无</dd></div>
+    </dl>
+  </section>
+
+  <!-- ===== 6. 日志 ===== -->
+  <section class="card">
+    <h2>日志</h2>
+    <div class="row row-actions">
+      <button id="btn-logs-refresh" class="btn" type="button">刷新日志</button>
+      <label class="toggle" for="logs-auto">
+        <input id="logs-auto" type="checkbox">
+        <span>自动刷新</span>
+      </label>
+      <label class="select-label" for="logs-level">
+        <span>级别</span>
+        <select id="logs-level" class="select">
+          <option value="all">全部</option>
+          <option value="debug">debug</option>
+          <option value="info">info</option>
+          <option value="warn">warn</option>
+          <option value="error">error</option>
+        </select>
+      </label>
+    </div>
+    <p id="logs-msg" class="msg" role="status" aria-live="polite"></p>
+    <pre id="logs" class="logs" tabindex="0" aria-label="服务日志">（暂无日志）</pre>
+  </section>
+
+  <p class="footer">AirPlay 2 → DLNA 桥接 · fnOS 应用</p>
+</div>
+
+<noscript>
+  <p class="noscript">此页面需要启用 JavaScript 才能显示运行状态。</p>
+</noscript>
+
+<script src="js/app.js" defer></script>
+</body>
+</html>

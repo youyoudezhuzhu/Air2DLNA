@@ -1,0 +1,32 @@
+#!/bin/bash
+# 安装后：准备目录权限、写初始配置、确保可执行位
+set -u
+APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
+HOME_DIR="${TRIM_PKGHOME:-/vol1/@apphome/airplay2dlna}"
+RUN_USER="${TRIM_USERNAME:-airplay2dlna}"
+PYTHON="/var/apps/python312/target/bin/python3"
+LOGF="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
+
+mkdir -p "$VAR" "$ETC" "$HOME_DIR" || { echo "无法创建应用数据目录" > "$LOGF"; exit 1; }
+chmod +x "$APP"/server/bin/* "$APP"/server/*.sh "$APP"/server/*.py "$APP"/cmd/* 2>/dev/null
+# 兜底：确保降权后的应用用户可以读取所有程序文件
+chmod -R a+rX "$APP" 2>/dev/null
+
+# 初始配置（写入向导里填的 AirPlay 名称与日志级别）
+# 必须用数组传参：向导值可能含空格（例如 "Feiniu AirPlay"），
+# 用未加引号的 $ARGS 会被 word-splitting 拆开，导致配置写入失败。
+ARGS=()
+[ -n "${wizard_airplay_name:-}" ] && ARGS+=("wizard_airplay_name=${wizard_airplay_name}")
+[ -n "${wizard_log_level:-}" ] && ARGS+=("wizard_log_level=${wizard_log_level}")
+if [ "${#ARGS[@]}" -gt 0 ]; then
+    "$PYTHON" "$APP/server/config_cli.py" --config-dir "$ETC" set "${ARGS[@]}" || true
+fi
+"$PYTHON" "$APP/server/config_cli.py" --config-dir "$ETC" init || { echo "初始化配置失败" > "$LOGF"; exit 1; }
+
+if id -u "$RUN_USER" >/dev/null 2>&1; then
+    chown -R "$RUN_USER" "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
+    chmod 750 "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
+fi
+exit 0
