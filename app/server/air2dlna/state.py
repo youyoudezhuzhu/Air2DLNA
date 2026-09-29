@@ -200,7 +200,7 @@ class BridgeController:
     KEEPALIVE_POSITION_SAMPLE_SECONDS = 1.0
     #: 暂停期间累计收到多少音频（秒）就认定 AirPlay 已恢复播放（兜底，无事件也生效）。
     #: 取 0.5 秒：暂停时残留的尾部数据不会超过这个量。
-    RESUMED_AUDIO_THRESHOLD_SECONDS = 0.5
+    RESUMED_AUDIO_THRESHOLD_SECONDS = 0.25
     #: 暂停恢复时允许「暂停位置」领先已写入数据的最大秒数。
     #: AirPlay 上报的位置必然略微领先 FIFO 已写入的数据（真机约 10 毫秒），
     #: 但领先过多说明位置本身不可信（或数据早已被覆盖），此时不该启用方案 A。
@@ -425,7 +425,12 @@ class BridgeController:
             self.timeline.on_pffr(item.text)
         elif code == "pvol":
             self._handle_volume(item)
-        elif code in (".", "pffr", "phb0", "phbt", "prsm", "psnc"):
+        elif code == "prsm":
+            # prsm = play stream resume：AirPlay 明确告知"流已恢复/继续播放"。
+            # 这是最可靠的恢复信号 —— 比靠"持续收到 PCM"推断更早、更准。
+            log.info("AirPlay 事件: prsm（播放流已恢复）")
+            self._handle_stream_resumed("prsm")
+        elif code in (".", "pffr", "phb0", "phbt", "psnc"):
             # 关键时序事件：正常不刷屏，但定位 seek/恢复问题必看
             log.info("AirPlay 事件: %s %s", code, (item.text or "")[:60])
         elif code == "PICT":
@@ -646,6 +651,44 @@ class BridgeController:
         self._keepalive_capable[udn] = False
         log.warning("keepalive: 标记渲染器 %s 不支持 keepalive（%s）——"
                     "后续暂停将直接使用 current 方案", udn or "?", reason)
+
+    def _handle_stream_resumed(self, source: str) -> None:
+        """AirPlay 明确表示播放流已恢复（``prsm``）：立即结束静音/暂停并恢复输出。
+
+        真机实测：拖动进度条时 AirPlay 通常不发 ``pres``/``pbeg``，但**会发 ``prsm``**，
+        随后 PCM 从新位置继续；只等 ``pres``/``pbeg`` 会一直停在暂停状态。
+        """
+        if self._silence_active:
+            # keepalive：渲染器一直在播，只需把输出层切回真实 PCM
+            self._resume_timeline = _ResumeTimeline(self.ring.byte_rate, "keepalive")
+            self._resume_timeline.mark("T0_airplay_resume")
+            self._stop_pause_keepalive(source)
+            self.timeline.on_resume()
+            with self._lock:
+                self.state.state = PLAYING
+                self._paused_audio_bytes = 0
+            log.info("%s: 结束 keepalive 静音并切回真实 PCM（未对渲染器做任何 UPnP 操作）", source)
+            return
+        with self._lock:
+            paused = self.state.state == PAUSED
+            pending_audio = self._paused_audio_bytes
+        if not paused:
+            return
+        threshold = int(self.ring.byte_rate * self.RESUMED_AUDIO_THRESHOLD_SECONDS)
+        if pending_audio < threshold:
+            # 位置信号到了但数据还没来 —— 交给轮询的音频兜底，
+            # 避免在元数据线程里做网络操作
+            self.timeline.on_resume()
+            with self._lock:
+                self.state.state = PLAYING
+            log.info("%s: 标记播放已恢复（等待音频数据到达）", source)
+            return
+        with self._lock:
+            self._paused_audio_bytes = 0
+        log.info("%s: 暂停状态下收到恢复信号且已有音频数据 → 主动重建 DLNA 会话", source)
+        self._clear_pause_recovery(source)
+        self._begin_new_generation(reason="stream-resumed", offset_ms=None)
+        self._start_dlna_session(reason="stream-resumed")
 
     def _check_resumed_without_event(self) -> None:
         """兜底：暂停中却持续收到 PCM → 主动恢复播放。
@@ -1688,7 +1731,7 @@ class BridgeController:
             "诊断: airplay_pos=%s state=%s renderer=%s rel_time=%s offset=%s rate=%s "
             "gen=%s token=%s http_clients=%s bytes_served=%s last_range=%s "
             "idle=%.1fs uri_count=%d last_rebuild=%s awaiting_new_stream=%s pause_recovery=%s "
-            "keepalive_capable=%s",
+            "keepalive_capable=%s tl_playing=%s",
             int(self.timeline.position_ms()) if self.timeline.position_ms() is not None else "-",
             state_name, renderer_state,
             int(self.timeline.renderer_rel_time_ms) if self.timeline.renderer_rel_time_ms is not None else "-",
@@ -1703,6 +1746,7 @@ class BridgeController:
             ("active" if self._pause_recovery_deadline > 0.0
              else ("armed" if self._pause_recovery_pending else "-")),
             self._keepalive_capable.get(self._keepalive_udn(), None),
+            getattr(self.timeline, "_playing", None),
         )
 
     def _sync_positions(self) -> None:

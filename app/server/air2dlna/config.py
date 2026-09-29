@@ -48,7 +48,11 @@ DEFAULTS: dict[str, Any] = {
     #               恢复时直接切回真实 PCM（目标 <500ms，失败自动回落 current）
     #   prewarm   = 暂停期间提前换代 + SetURI（不 Play），恢复时只补一个 Play
     #   auto      = 先 keepalive，失败/超时自动退化到 current
-    "recovery_mode": "keepalive",
+    # 注意：keepalive 在真机上确实能把恢复时间从约 3 秒压到约 1 秒，但会带来
+    # 「渲染器播放位置随每次暂停累计超前」（真机实测 offset -33s → -49s），
+    # 使后续 seek 的位置基准失真（表现为调整进度条有概率播放失败）。
+    # 因此默认保持稳定的 current，keepalive 作为实验选项供对照测试。
+    "recovery_mode": "current",
     # keepalive 最长保持时间（秒）：超时后回落 current，避免音箱长期空转
     "pause_keepalive_timeout_seconds": 30,
     # GENA 不可用时的位置轮询间隔（秒）
