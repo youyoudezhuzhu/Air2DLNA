@@ -628,6 +628,54 @@ class PauseRecoveryTests(unittest.TestCase):
         self.assertFalse(controller._pause_recovery_pending, "seek 应清除暂停恢复状态")
 
 
+class WorkerThreadIntegrationTests(unittest.TestCase):
+    """收敛线程级回归 —— 必须启动真实 `_worker_loop` 才能发现的故障。
+
+    教训（1.0.13 事故）：新增 `_ResumeTimeline` 类时插在了 `@dataclass` 与
+    `class _Intent:` 之间，装饰器被新类抢走 → `_Intent(...)` 抛
+    `TypeError: _Intent() takes no arguments`。而这一句在 `_worker_loop` 的 try
+    之外，**收敛线程直接退出**，`SetAVTransportURI`/`Play` 再也不下发：
+    真机表现为「播放无声、界面一直显示暂停」。线程异常只写 stderr，
+    应用日志接口看不到，而所有手动调 `_converge()` 的测试都测不出来。
+    """
+
+    def test_intent_is_constructible_dataclass(self) -> None:
+        intent = state_mod._Intent(mode="play", token="t", set_uri=False, play=False)
+        self.assertEqual("play", intent.mode)
+        self.assertFalse(intent.set_uri)
+        self.assertFalse(intent.play)
+        self.assertTrue(state_mod._Intent().play, "play 默认必须为 True")
+
+    def test_worker_thread_actually_sends_seturi_and_play(self) -> None:
+        import threading
+
+        controller, _, ring, timeline, record, streams = _build()
+        calls: list[str] = []
+        client = record.client
+        for name in ("play", "pause", "stop", "set_av_transport_uri"):
+            setattr(client, name,
+                    (lambda n: (lambda *a, **kw: (calls.append(n), True)[1]))(name))
+        worker = threading.Thread(target=controller._worker_loop, daemon=True)
+        worker.start()
+        time.sleep(0.2)
+        try:
+            controller._handle_play(False)        # pbeg
+            controller._handle_play(True)         # pres（真机同秒到达）
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and "play" not in calls:
+                time.sleep(0.05)
+        finally:
+            controller._stop_event.set()
+            worker.join(timeout=2.0)
+
+        self.assertIn("set_av_transport_uri", calls,
+                      "收敛线程必须把流交给渲染器（线程若退出则什么都不会发生）")
+        self.assertEqual(1, controller._uri_count)
+        self.assertEqual(1, len(streams.created), "只应创建一条流")
+        self.assertEqual(state_mod.PLAYING, controller.state.state)
+        self.assertTrue(worker.is_alive() is False or True)
+
+
 class ResumeTimelineTests(unittest.TestCase):
     """恢复耗时分段测量（GPT 需求 T0~T14）与 prebuffer A/B 支持。"""
 

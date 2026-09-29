@@ -165,6 +165,7 @@ class _ResumeTimeline:
         return "\n".join(lines)
 
 
+@dataclass
 class _Intent:
     """收敛线程要达成的目标。"""
 
