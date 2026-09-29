@@ -95,24 +95,19 @@ class _Intent:
 class BridgeController:
     """把 AirPlay 事件、PCM 缓冲、DLNA 渲染器粘合在一起。"""
 
-    #: 会话建立后的漂移宽限期（秒）：渲染器此时仍在缓冲，位置值不可比。
-    #: 取得比音箱缓冲建立时间略长，避免一上来就误判。
-    DRIFT_GRACE_SECONDS = 12.0
-    #: 两次漂移重建之间的最小间隔（秒），避免抖动造成反复切断播放
-    DRIFT_REBUILD_COOLDOWN_SECONDS = 10.0
-    #: 单个播放会话内允许的漂移重建次数上限，超过则停止自动重建
-    DRIFT_REBUILD_LIMIT = 5
-    #: 判定「渲染器固定延迟」用的样本数与相邻样本允许的变化量。
-    #: 音箱自身的内部缓冲/淡入表现为一个**不再增长的**恒定偏差（真机实测约 3~4 秒，
-    #: 相邻采样间会小幅抖动）；真正的漂移则每个采样都在明显增长。
-    #: 只有后者才值得重建会话 —— 重建会让音箱重新淡入（听感是声音突然变小又变大）。
-    #: 用「相邻变化幅度」而不是「极差」判定，是为了容忍音箱缓冲的抖动。
-    DRIFT_STABLE_SAMPLES = 3
-    DRIFT_STABLE_STEP_MS = 700.0
-    #: 自动延迟补偿的上限（需落在配置项 av_offset_ms 的合法区间 ±10000 内）
-    MAX_AUTO_LATENCY_MS = 9000.0
-    #: 渲染器「声称在播放但没有拉流」多久后触发兜底重建（秒）
-    STREAM_STALL_SECONDS = 6.0
+    #: 「渲染器没在拉流」多久后触发兜底重建（秒）
+    STREAM_STALL_SECONDS = 8.0
+    #: AirPlay `pend`（播放流结束）后的过渡窗口（秒）。
+    #: pend 不等价于会话结束：seek / 换曲都可能触发它，立刻 Stop DLNA 会让
+    #: iPhone 拖动进度条后长时间无声。窗口内收到新的流事件就继续播放，
+    #: 超时才按真正的播放结束处理。
+    PEND_TRANSITION_TIMEOUT_SECONDS = 4.0
+    #: Renderer 重建（换 generation / 换 URI）后的最小间隔（秒），防止风暴
+    REBUILD_COOLDOWN_SECONDS = 10.0
+    #: 诊断日志输出间隔（秒）
+    DIAGNOSTIC_INTERVAL_SECONDS = 15.0
+    #: 判定「渲染器时钟速率异常」的相对偏差容差（ΔRelTime / ΔAirPlay）
+    RELTIME_RATE_TOLERANCE = 0.03
 
     def __init__(self, config, registry, ring: PcmRingBuffer, timeline: AudioTimeline,
                  streams: stream.StreamManager, log=None) -> None:
@@ -139,16 +134,27 @@ class BridgeController:
         self._paused_with_stop = False
         self._action_errors = 0
         self._pending_reanchor = False
-        #: 当前 DLNA 会话的建立时刻（用于漂移宽限期）
+        #: 当前 DLNA 会话的建立时刻
         self._session_started_at = 0.0
-        #: 漂移重建的冷却与次数控制（防止反复重建把播放切成碎片）
-        self._last_drift_rebuild = 0.0
-        self._drift_rebuilds = 0
-        self._drift_limit_logged = False
-        #: 最近的漂移样本，用于区分「固定延迟」与「真实漂移」
-        self._drift_history: deque[float] = deque(maxlen=self.DRIFT_STABLE_SAMPLES)
+        #: 重建冷却（stalled 兜底 / 过渡超时等都用它，避免重建风暴）
+        self._last_rebuild_at = 0.0
         #: 上次因「渲染器没在拉流」而重建的时刻
         self._last_stall_rebuild = 0.0
+        #: pend 过渡态
+        self._awaiting_new_stream = False
+        self._transition_deadline = 0.0
+        self._transition_reason = ""
+        #: 诊断：DLNA 侧位置只作观测
+        self._rel_sample: Optional[tuple[float, float]] = None
+        self._rel_offset_ms: Optional[float] = None
+        self._rel_rate: Optional[float] = None
+        self._rel_observed_at = 0.0
+        self._last_range_info = ""
+        self._last_diag_log = 0.0
+        #: 每次 SetAVTransportURI 的序号与原因（验收要求：正常播放应该只有 1 次）
+        self._uri_count = 0
+        self._uri_log: list[str] = []
+        self._last_rebuild_reason = ""
         #: 上一轮收敛失败需要重试（由 _safe_call 置位）
         self._converge_dirty = False
         self._last_volume_tx = 0.0
@@ -191,6 +197,9 @@ class BridgeController:
     def on_audio_bytes(self, data: bytes) -> None:
         """音频读取线程回调：把 FIFO 数据推进环形缓冲。"""
         self.ring.append(data)
+        if self._awaiting_new_stream:
+            # 仍有 PCM 进来 → 播放流并未真正结束（只是事件次序），立刻退出过渡态
+            self._cancel_transition("仍在推送 PCM")
 
     # --------------------------------------------------------------- 元数据入口
     def on_metadata_item(self, item: MetadataItem) -> None:
@@ -230,7 +239,11 @@ class BridgeController:
             self._handle_play(code == "pres")
         elif code == "paus":
             self._handle_pause()
-        elif code in ("pend", "aend"):
+        elif code == "pend":
+            # pend = AirPlay **播放流**结束，不能当成整个会话结束：
+            # 拖动进度条、切歌都可能只发 pend 并紧跟新的流事件。
+            self._handle_play_stream_end("播放流结束")
+        elif code == "aend":
             self._handle_session_end("播放结束")
         elif code == "pfls":
             self._handle_flush(item.text)
@@ -306,10 +319,11 @@ class BridgeController:
 
         # pbeg：新的播放会话
         log.info("AirPlay session started")
-        self._drift_rebuilds = 0
-        self._drift_limit_logged = False
-        self._last_drift_rebuild = 0.0
-        self._drift_history.clear()
+        self._cancel_transition("pbeg")
+        # 新的播放会话：重建计数与 SetAVTransportURI 计数都归零
+        # （验收标准：一次正常播放全过程只应出现 1 次 SetAVTransportURI）
+        self._last_rebuild_at = 0.0
+        self._uri_count = 0
         self._begin_new_generation(reason="pbeg", offset_ms=None)
         self._start_dlna_session(reason="pbeg")
 
@@ -320,13 +334,58 @@ class BridgeController:
         self._set_intent(_MODE_PAUSE, self._gen_token)
 
     def _handle_flush(self, payload: str) -> None:
-        """``pfls``：seek。载荷是要 flush 到的帧号。"""
-        log.info("SetAVTransportURI 需要重锚：检测到 seek/flush (frame=%s)", payload or "?")
+        """``pfls`` / ``pdis``：真实 seek。载荷是要 flush 到的帧号。
+
+        这是**唯一**由 AirPlay 侧驱动的媒体生命周期变更（需求 A 类）：
+        flush 旧 PCM → 新 generation → 新 token/URI → SetAVTransportURI → Play。
+        """
+        self._cancel_transition("seek/flush")
+        log.info("检测到 seek/flush (frame=%s)：换代并重锚 DLNA 会话", payload or "?")
         self._begin_new_generation(reason="flush", offset_ms=None)
         with self._lock:
             self._pending_reanchor = True
         # AirPlay 侧的新位置通过随后的 prgr 得知，preroll 期间即可修正
         self._start_dlna_session(reason="seek")
+
+    def _handle_play_stream_end(self, reason: str) -> None:
+        """``pend``：AirPlay 播放流结束 —— **不等价于**整个会话结束。
+
+        iPhone 拖动进度条、切歌、短暂停顿都可能只发 ``pend``，随后紧跟
+        ``pbeg`` 或新的 PCM。旧实现在这里直接 Stop DLNA + flush 缓冲 + 清空
+        session，真机上表现为「拖完进度条后长时间无声」（实测约 79 秒空窗）。
+        改为进入短过渡态：DLNA 侧保持原样，等后续事件；超时才真正结束。
+        """
+        with self._lock:
+            if self.state.state == STOPPED:
+                log.info("AirPlay 播放流结束（%s）；当前已是停止态，无需过渡", reason)
+                return
+            self._awaiting_new_stream = True
+            self._transition_deadline = time.monotonic() + self.PEND_TRANSITION_TIMEOUT_SECONDS
+            self._transition_reason = reason
+        log.info(
+            "AirPlay 播放流结束（%s）：进入过渡态，DLNA 会话保持不变；%.1fs 内没有新的流才真正停止",
+            reason, self.PEND_TRANSITION_TIMEOUT_SECONDS)
+
+    def _cancel_transition(self, why: str) -> None:
+        """退出 pend 过渡态：继续使用当前 generation/token。"""
+        with self._lock:
+            if not self._awaiting_new_stream:
+                return
+            self._awaiting_new_stream = False
+            self._transition_deadline = 0.0
+        log.info("过渡态结束（%s）：继续沿用当前 DLNA 会话 gen=%d", why, self.ring.generation)
+
+    def _check_transition_timeout(self) -> None:
+        """收敛线程轮询：过渡窗口内没有新流事件，才按真正的播放结束处理。"""
+        with self._lock:
+            if not self._awaiting_new_stream:
+                return
+            if time.monotonic() < self._transition_deadline:
+                return
+            self._awaiting_new_stream = False
+        log.info("过渡态超时（%.1fs 内没有新的 AirPlay 流），按播放结束处理",
+                 self.PEND_TRANSITION_TIMEOUT_SECONDS)
+        self._handle_session_end("过渡超时")
 
     def _handle_session_end(self, reason: str) -> None:
         log.info("AirPlay session ended (%s)", reason)
@@ -347,11 +406,14 @@ class BridgeController:
             self._renderer_token = ""
             self._paused_with_stop = False
             self._pending_reanchor = False
-        self._drift_rebuilds = 0
-        self._drift_limit_logged = False
-        self._last_drift_rebuild = 0.0
+        with self._lock:
+            self._awaiting_new_stream = False
+            self._transition_deadline = 0.0
         self._session_started_at = 0.0
-        self._drift_history.clear()
+        self._rel_sample = None
+        self._rel_offset_ms = None
+        self._rel_rate = None
+        self._last_rebuild_at = 0.0
         self.streams.close_all()
         self._set_intent(_MODE_STOP, "")
 
@@ -403,6 +465,8 @@ class BridgeController:
                 self._pre_flush_hook()
             except Exception:  # noqa: BLE001
                 log.debug("换代前钩子执行失败", exc_info=True)
+        self._last_rebuild_reason = reason
+        self._last_rebuild_at = time.monotonic()
         generation = self.ring.flush()
         kind, _content_type = "wav", "audio/wav"
         with self._lock:
@@ -425,6 +489,7 @@ class BridgeController:
 
     def _start_dlna_session(self, reason: str) -> None:
         """创建新一代流并请求收敛线程去播放它。"""
+        self._uri_reason = reason
         record = self.registry.selected()
         if record is None:
             log.warning("尚未选择 DLNA Renderer，无法开始播放（%s）", reason)
@@ -566,7 +631,17 @@ class BridgeController:
             bits=session.bits,
         )
 
-        log.info("SetAVTransportURI %s (type=%s)", uri, session.content_type)
+        self._uri_count += 1
+        self._uri_log.append(
+            "#%d reason=%s gen=%d t=%s"
+            % (self._uri_count, self._uri_reason, session.generation,
+               time.strftime("%H:%M:%S"))
+        )
+        del self._uri_log[:-20]
+        log.info(
+            "SetAVTransportURI #%d reason=%s generation=%d renderer=%s uri=%s (type=%s)",
+            self._uri_count, self._uri_reason, session.generation, record.name, uri,
+            session.content_type)
         if not self._safe_call(record, client.set_av_transport_uri, "SetAVTransportURI",
                                uri=uri, metadata=metadata):
             return
@@ -659,6 +734,9 @@ class BridgeController:
             try:
                 self._poll_once()
                 self._renew_subscriptions_if_due()
+                # pend 过渡窗口到期检查（不依赖渲染器是否可达）
+                self._check_transition_timeout()
+                self._log_diagnostics()
             except Exception:  # noqa: BLE001
                 log.exception("位置轮询异常")
             # 加 ±20% 抖动，避免与设备自身的定时任务共振
@@ -724,7 +802,7 @@ class BridgeController:
                     duration = self.timeline.duration_ms()
                 with self._lock:
                     self.state.duration_ms = duration
-                self._check_drift(record)
+                self._observe_renderer_timeline()
 
         self._check_renderer_stream()
 
@@ -747,104 +825,81 @@ class BridgeController:
         if idle <= self.STREAM_STALL_SECONDS:
             return
         now = time.monotonic()
-        if now - self._last_stall_rebuild <= self.DRIFT_REBUILD_COOLDOWN_SECONDS:
+        if now - self._last_stall_rebuild <= self.REBUILD_COOLDOWN_SECONDS:
             return
         self._last_stall_rebuild = now
         log.warning("渲染器 %.0fs 未拉取音频流（seek/恢复后未重连），重建 DLNA 会话", idle)
-        self._drift_history.clear()
         self._begin_new_generation(reason="stalled", offset_ms=None)
         self._start_dlna_session(reason="stalled")
 
-    def _check_drift(self, record) -> None:
-        drift = self.timeline.drift_ms()
-        if drift is None:
-            return
-        # 会话刚建立时渲染器仍在缓冲，rel_time 尚未反映真实播放位置，
-        # 此时比较只会得到假漂移（并触发无意义的重建）。
-        if time.monotonic() - self._session_started_at < self.DRIFT_GRACE_SECONDS:
-            return
-        threshold = float(self.config.get("drift_threshold_ms"))
-        if abs(drift) <= threshold:
-            self._drift_history.clear()
-            return
+    def _observe_renderer_timeline(self) -> None:
+        """把 DLNA 侧的位置信息当作**观测值**：只诊断，绝不驱动重建。
 
-        # —— 区分「渲染器固定延迟」与「真实漂移」 ——
-        # 音箱内部缓冲 / 淡入会带来一个**稳定的**恒定偏差（真机实测小爱音箱约 3~4 秒）。
-        # 重建会话会让音箱重新淡入（听感：播放一小段，声音突然变小又变大），所以固定
-        # 偏差应当补偿掉而不是重建；只有持续变化（越走越远）的漂移才值得重建。
-        self._drift_history.append(drift)
-        if len(self._drift_history) < self.DRIFT_STABLE_SAMPLES:
-            log.debug("漂移 %.0f ms，样本不足（%d/%d），先观察不重建",
-                      drift, len(self._drift_history), self.DRIFT_STABLE_SAMPLES)
-            return
-        history = list(self._drift_history)
-        steps = [abs(history[i] - history[i - 1]) for i in range(1, len(history))]
-        if steps and all(step <= self.DRIFT_STABLE_STEP_MS for step in steps):
-            average = sum(history) / len(history)
-            if self._absorb_latency(average, record):
-                self._drift_history.clear()
-                return
+        架构约定（1.0.5）：
 
-        if self._drift_rebuilds >= self.DRIFT_REBUILD_LIMIT:
-            if not self._drift_limit_logged:
-                self._drift_limit_logged = True
-                log.warning(
-                    "漂移反复出现（本会话已重建 %d 次，最近偏差 %.0f ms），"
-                    "停止自动重建以免把播放切成碎片：%s（可重新播放或切换设备恢复对齐）",
-                    self._drift_rebuilds, drift, record.name,
-                )
-            return
-        now = time.monotonic()
-        if now - self._last_drift_rebuild < self.DRIFT_REBUILD_COOLDOWN_SECONDS:
-            log.debug("漂移 %.0f ms 仍在重建冷却期内，本次跳过", drift)
-            return
-        self._drift_rebuilds += 1
-        self._last_drift_rebuild = now
-        log.warning(
-            "检测到时间线漂移 %.0f ms（阈值 %.0f ms），重建 DLNA 会话以对齐: %s（第 %d 次）",
-            drift, threshold, record.name, self._drift_rebuilds,
-        )
-        # **必须换代**：
-        # ① 不换代时渲染器从本代 offset=0 重新拉流，读到的是这一代里最早的数据
-        #    （可能已是几十秒前的音频）—— 听感就是同一小段被反复重播；
-        # ② 换代时 begin_generation() 会把「当前曲目位置」记为新基准偏移，
-        #    漂移检测才有正确的参照。否则漂移恒等于曲目绝对位置，每 2~3 秒
-        #    重建一次，形成死循环。
-        # 换代后基准变了，**旧样本必须清空** —— 否则上一代那个大偏差会一直留在
-        # 样本窗口里，让相邻差值永远超限，固定延迟再也无法被识别（表现为「重建
-        # 间隔被拉长但周期性声音变小依旧存在」）。
-        self._drift_history.clear()
-        self._begin_new_generation(reason="drift", offset_ms=None)
-        self._start_dlna_session(reason="drift")
+        * **AirPlay / Shairport Sync 的时间线是唯一权威时间线**；
+        * DLNA 的 ``RelTime``、``GetPositionInfo``、渲染器内部缓冲延迟、
+          HTTP ``Range``、HTTP 重连都只是渲染器的状态 / 进度 / 健康信息；
+        * 渲染器报告的绝对位置与 AirPlay 时间线存在**固定偏差**时，那是
+          渲染器缓冲延迟（真机实测音箱约 3~4 秒），**不是漂移**。据此换代重建
+          会让音箱重新淡入 —— 听感正是「播放十几秒后声音突然变小又变大」；
+        * 因此这里只计算并记录两个量：
 
-    def _absorb_latency(self, drift_ms: float, record) -> bool:
-        """把稳定的漂移当渲染器固定延迟补偿掉。
+          - ``offset``：AirPlay 位置 −（代偏移 + RelTime）；稳定 = 缓冲延迟
+          - ``rate``：ΔRelTime / ΔAirPlay；持续偏离 1.0 才是真正的时钟漂移
 
-        返回 True 表示已吸收（调用方不应再重建会话）。重建会让音箱重新淡入，
-        这正是「播放一小段声音就变小再变大」的来源，所以能用补偿解决的绝不重建。
+        真正的时钟漂移目前**只记录 warning，不自动重建**（需要重建的只有三类
+        明确原因：真实 seek、渲染器链路真的断了、播放真的结束）。
         """
-        current = self.timeline.renderer_latency_ms
-        target = current + drift_ms
-        if abs(target) > self.MAX_AUTO_LATENCY_MS:
-            # 注意：这里**不能**清空样本历史 —— 清了就永远攒不够判定所需的样本数，
-            # 真正的漂移反而再也触发不了重建。保持原样让流程继续走到重建分支。
+        rel_time = self.timeline.renderer_rel_time_ms
+        position = self.timeline.position_ms()
+        if rel_time is None or position is None:
+            return
+        offset = position - (self.timeline.generation_offset_ms + rel_time)
+        previous = self._rel_sample
+        if previous is not None:
+            delta_air = position - previous[0]
+            delta_rel = rel_time - previous[1]
+            # 至少 1 秒的间隔才计算速率，避免采样噪声把速率算飞
+            if delta_air >= 1000.0:
+                self._rel_rate = delta_rel / delta_air
+        self._rel_sample = (position, rel_time)
+        self._rel_offset_ms = offset
+        self._rel_observed_at = time.monotonic()
+        if self._rel_rate is not None and abs(self._rel_rate - 1.0) > self.RELTIME_RATE_TOLERANCE:
             log.warning(
-                "固定偏差 %.0f ms 补偿后为 %.0f ms，超出上限 %.0f ms，按真实漂移处理",
-                drift_ms, target, self.MAX_AUTO_LATENCY_MS,
+                "渲染器时钟速率偏离（ΔRelTime/ΔAirPlay=%.4f，位置偏差=%.0f ms）："
+                "仅记录诊断，不重建会话",
+                self._rel_rate, offset,
             )
-            return False
-        self.timeline.set_renderer_latency_ms(target)
+
+    def _log_diagnostics(self) -> None:
+        """周期性输出完整状态，便于真机分析（验收要求）。"""
+        now = time.monotonic()
+        if now - self._last_diag_log < self.DIAGNOSTIC_INTERVAL_SECONDS:
+            return
+        self._last_diag_log = now
+        token = self._renderer_token
+        session = self.streams.get(token) if token else None
+        with self._lock:
+            state_name = self.state.state
+            renderer_state = self.state.renderer_state
         log.info(
-            "渲染器 %s 存在 %.0f ms 固定播放延迟（音箱内部缓冲/淡入），已自动补偿为 "
-            "%.0f ms：不再重建会话，避免反复淡入",
-            record.name, drift_ms, target,
+            "诊断: airplay_pos=%s state=%s renderer=%s rel_time=%s offset=%s rate=%s "
+            "gen=%s token=%s http_clients=%s bytes_served=%s last_range=%s "
+            "idle=%.1fs uri_count=%d last_rebuild=%s awaiting_new_stream=%s",
+            int(self.timeline.position_ms()) if self.timeline.position_ms() is not None else "-",
+            state_name, renderer_state,
+            int(self.timeline.renderer_rel_time_ms) if self.timeline.renderer_rel_time_ms is not None else "-",
+            int(self._rel_offset_ms) if self._rel_offset_ms is not None else "-",
+            "%.4f" % self._rel_rate if self._rel_rate is not None else "-",
+            self.ring.generation, token[-6:] if token else "-",
+            session.clients if session is not None else 0,
+            int(session.bytes_served) if session is not None else 0,
+            self._last_range_info or "-",
+            (now - session.last_activity) if session is not None and session.last_activity else -1.0,
+            self._uri_count, self._last_rebuild_reason or "-", self._awaiting_new_stream,
         )
-        # 顺手写回配置，下次播放无需重新学习（写不成也不影响本次播放）
-        try:
-            self.config.update({"av_offset_ms": int(round(target))})
-        except Exception:  # noqa: BLE001
-            log.debug("延迟补偿写回配置失败，不影响本次播放", exc_info=True)
-        return True
 
     def _sync_positions(self) -> None:
         position = self.timeline.position_ms()
@@ -965,6 +1020,17 @@ class BridgeController:
                 "renderer": renderer_info,
                 "timeline": self.timeline.snapshot(),
                 "buffer": self.ring.stats(),
+                "diagnostics": {
+                    "generation": self.ring.generation,
+                    "renderer_rel_time_ms": self.timeline.renderer_rel_time_ms,
+                    "rel_offset_ms": self._rel_offset_ms,
+                    "rel_rate": self._rel_rate,
+                    "uri_count": self._uri_count,
+                    "uri_log": list(self._uri_log),
+                    "last_rebuild_reason": self._last_rebuild_reason,
+                    "awaiting_new_stream": self._awaiting_new_stream,
+                    "transition_reason": self._transition_reason,
+                },
                 "intent": {"mode": self._intent.mode, "token": self._intent.token},
             }
 

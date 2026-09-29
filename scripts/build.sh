@@ -145,6 +145,24 @@ build_shairport() {
     rm -rf "$WORK/shairport-sync-src"
     git clone --depth 1 https://github.com/mikebrady/shairport-sync.git "$WORK/shairport-sync-src" >/dev/null 2>&1 \
         || die "克隆 shairport-sync 失败"
+
+    # ---- 设备类别：让 iOS 把本机识别为「音响 / 扬声器」而不是通用声音输出 ----
+    # shairport-sync 的两个设备标识是**编译期常量**（没有对应配置项），
+    # 上游源码注释里直接给出了音频接收设备的参考值：
+    #     // config.model = strdup("AirPort10,115");
+    #     // features=0x0001C340445D0A00 -- AirPort Express
+    # 这里改为音频接收设备的值（AirPlay 2 / NQPTP / _airplay / _raop 能力位不变，
+    # 仅替换设备型号与 features 位），客户端据此显示为音响类设备。
+    sed -i 's|config.model = strdup("ShairportSync");|config.model = strdup("AirPort10,115");|' \
+        "$WORK/shairport-sync-src/shairport.c"
+    sed -i 's|config.airplay_features = 0x00018340405C4A00;|config.airplay_features = 0x0001C340445D0A00;|' \
+        "$WORK/shairport-sync-src/shairport.c"
+    grep -q 'AirPort10,115' "$WORK/shairport-sync-src/shairport.c" \
+        || die "设备类别替换失败（model）—— 上游源码结构可能已变更"
+    grep -q '0x0001C340445D0A00' "$WORK/shairport-sync-src/shairport.c" \
+        || die "设备类别替换失败（features）—— 上游源码结构可能已变更"
+    log "已设置 AirPlay 设备类别为音频接收设备（model=AirPort10,115）"
+
     local avahi_libdir="$AVAHI_ROOT/usr/lib/x86_64-linux-gnu"
     (
       cd "$WORK/shairport-sync-src"

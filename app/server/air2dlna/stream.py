@@ -160,6 +160,9 @@ class StreamSession:
     bytes_served: int = 0
     clients: int = 0
     closed: bool = False
+    #: 诊断：本 token 被拉取的次数与最近一次 Range 起点（HTTP 层细节，不触发换代）
+    range_requests: int = 0
+    last_range_info: str = ""
 
     @property
     def byte_rate(self) -> int:
@@ -283,9 +286,16 @@ class StreamManager:
     def serve(self, session: StreamSession, wfile, head_only: bool = False,
               range_start: int = 0, close_callback=None, idle_timeout: float = 20.0) -> None:
         """把 ``session`` 对应的 PCM 数据写入 ``wfile``（阻塞直到结束）。"""
+        # HTTP Range / 重连属于**传输层细节**，不是用户 seek：同一个
+        # generation/token 下渲染器可以任意次 GET / Range / reconnect，都不允许
+        # 引起换代或 SetAVTransportURI（换代会让音箱重新缓冲并淡入）。此处只记录观测值。
+        session.range_requests += 1
+        session.last_range_info = "start=%d(%.1fs) head=%s req=%d" % (
+            range_start, range_start / float(session.byte_rate or 1), head_only,
+            session.range_requests)
         log.info(
-            "渲染器开始拉流: token=%s gen=%d head=%s range_start=%s",
-            session.token, session.generation, head_only, range_start,
+            "渲染器开始拉流: token=%s gen=%d head=%s range_start=%s (第 %d 次连接)",
+            session.token, session.generation, head_only, range_start, session.range_requests,
         )
         with self._lock:
             session.clients += 1
