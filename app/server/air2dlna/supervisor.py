@@ -153,11 +153,61 @@ def _remove_pid_file(path: str) -> None:
         pass
 
 
+#: 单个日志文件的上限与超限后保留的尾部长度（默认 5MB / 1MB）
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_KEEP_BYTES = 1 * 1024 * 1024
+
+
+def trim_log_file(path: str, max_bytes: int = LOG_MAX_BYTES,
+                  keep_bytes: int = LOG_KEEP_BYTES) -> int:
+    """文件超过 ``max_bytes`` 时只保留尾部 ``keep_bytes``，返回释放的字节数。
+
+    做法是**原地重写**（同一 inode 上 truncate + write），不是 rename —— 因为写入方
+    （子进程 stdout/stderr、shell 的 ``>>``）以 O_APPEND 持有该文件描述符；rename 后
+    它们会继续写进已改名的旧 inode，新文件永远收不到内容。原地重写则完全无感。
+    """
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return 0
+    if size <= max_bytes:
+        return 0
+    try:
+        with open(path, "rb") as handle:
+            handle.seek(max(0, size - keep_bytes))
+            tail = handle.read()
+        # 丢掉可能被截断的首行，避免日志里出现半行
+        newline = tail.find(b"\n")
+        if newline != -1:
+            tail = tail[newline + 1:]
+        marker = (f"[logrotate] {time.strftime('%Y-%m-%d %H:%M:%S')} 超过 "
+                  f"{max_bytes // (1024 * 1024)}MB，已保留尾部 "
+                  f"{keep_bytes // 1024}KB\n").encode("utf-8")
+        with open(path, "r+b") as handle:
+            handle.seek(0)
+            handle.write(marker)
+            handle.write(tail)
+            handle.truncate()
+    except OSError:
+        return 0
+    try:
+        new_size = os.path.getsize(path)
+    except OSError:
+        new_size = 0
+    return max(0, size - new_size)
+
+
 class ProcessSupervisor:
     """监管一个子进程，异常退出时按退避策略重启。"""
 
     #: 重启退避序列（秒），之后维持最后一个值
     BACKOFF = (1.0, 2.0, 5.0, 10.0, 30.0)
+
+    #: 日志上限与保留长度（模块级常量的实例副本，便于测试覆盖）
+    log_max_bytes = LOG_MAX_BYTES
+    log_keep_bytes = LOG_KEEP_BYTES
+    #: 每 N 个看护周期（2s/周期）检查一次日志大小
+    LOG_CHECK_EVERY = 30
 
     def __init__(self, name: str, argv: list[str], log_path: str,
                  env: Optional[dict] = None, cwd: Optional[str] = None,
@@ -177,6 +227,7 @@ class ProcessSupervisor:
         self.restarts = 0
         self.last_exit_code: Optional[int] = None
         self.last_start_monotonic: float = 0.0
+        self._log_ticks = 0
 
     # ------------------------------------------------------------------ 状态
     @property
@@ -292,6 +343,21 @@ class ProcessSupervisor:
                                         name=f"watchdog-{self.name}", daemon=True)
         self._thread.start()
 
+    # ------------------------------------------------------------ 日志轮转
+    def _tick_log_rotation(self) -> None:
+        """在看护循环里定期修剪子进程日志，避免无上限增长。
+
+        标准库的 RotatingFileHandler 只管 Python 进程自己的日志；shairport-sync
+        这类子进程直接往文件里写，必须由监管方管上限（debug 级别输出量很大）。
+        """
+        self._log_ticks += 1
+        if self._log_ticks % self.LOG_CHECK_EVERY != 0:
+            return
+        freed = trim_log_file(self.log_path, self.log_max_bytes, self.log_keep_bytes)
+        if freed:
+            log.info("%s 日志超过上限，已保留尾部并释放 %.1f MB: %s",
+                     self.name, freed / (1024 * 1024), self.log_path)
+
     def _watchdog_loop(self) -> None:
         backoff_index = 0
         while not self._stop_event.is_set():
@@ -305,6 +371,7 @@ class ProcessSupervisor:
             code = process.poll()
             if code is None:
                 backoff_index = 0
+                self._tick_log_rotation()
                 continue
             self.last_exit_code = code
             log.error("%s 异常退出 (exit=%s)，准备重启", self.name, code)

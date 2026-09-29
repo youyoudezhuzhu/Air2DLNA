@@ -13,10 +13,32 @@ BIN="${TRIM_APPDEST:-/var/apps/air2dlna/target}/server/bin/nqptp"
 PID_FILE="$VAR/nqptp.pid"
 LOG="$VAR/nqptp.log"
 MAIN_LOG="$VAR/main.log"
+BRIDGE_STDERR_LOG="$VAR/bridge-stderr.log"
 STOP_FILE="$VAR/nqptp-watchdog.stop"
+
+# 日志上限与保留尾部（与 cmd/main、supervisor.py 保持一致）
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-5242880}"    # 5 MiB
+LOG_KEEP_BYTES="${LOG_KEEP_BYTES:-1048576}"  # 1 MiB
 
 log_msg() {
     echo "$(date '+%Y-%m-%d %H:%M:%S') - $*" >> "$MAIN_LOG"
+}
+
+# 超限时原地保留尾部（不能 mv：nqptp 以 >> 持有该文件，mv 后写入会落到旧 inode）
+trim_log() {
+    local file="$1" size tmp
+    [ -f "$file" ] || return 0
+    size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+    case "$size" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$size" -le "$LOG_MAX_BYTES" ] && return 0
+    tmp="$file.rotate.tmp"
+    if tail -c "$LOG_KEEP_BYTES" "$file" > "$tmp" 2>/dev/null; then
+        if cat "$tmp" > "$file" 2>/dev/null; then
+            log_msg "[logrotate] 日志超过 $((LOG_MAX_BYTES / 1048576))MB（原 $size 字节），已保留尾部 $((LOG_KEEP_BYTES / 1024))KB: $(basename "$file")"
+        fi
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 0
 }
 
 is_running() {
@@ -55,10 +77,20 @@ stop_nqptp() {
 
 mkdir -p "$VAR"
 rm -f "$STOP_FILE"
+trim_log "$LOG"
 start_nqptp
 
+tick=0
 while [ ! -e "$STOP_FILE" ]; do
     sleep 10
+    tick=$((tick + 1))
+    # 每 60 秒给「没有内置轮转」的日志收口一次：
+    # nqptp.log（本脚本启动的进程）、main.log（生命周期）、bridge-stderr.log（bridge 的 stderr）
+    if [ $((tick % 6)) -eq 0 ]; then
+        trim_log "$LOG"
+        trim_log "$MAIN_LOG"
+        trim_log "$BRIDGE_STDERR_LOG"
+    fi
     if ! is_running; then
         log_msg "检测到 nqptp 已退出，正在重启"
         start_nqptp

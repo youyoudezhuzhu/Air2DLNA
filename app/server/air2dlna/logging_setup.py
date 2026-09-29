@@ -79,9 +79,13 @@ def setup_logging(log_path: str, level: str = "info", max_bytes: int = 5 * 1024 
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
-    console = logging.StreamHandler(sys.stderr)
-    console.setFormatter(formatter)
-    root.addHandler(console)
+    # 仅当 stderr 是终端时才加控制台输出。应用运行期 stderr 被生命周期脚本重定向到
+    # 文件（bridge-stderr.log），此时再加一个同内容的 handler 等于把同一批日志写两处
+    # —— 白白放大磁盘占用（日志上限也翻倍）。
+    if sys.stderr.isatty():
+        console = logging.StreamHandler(sys.stderr)
+        console.setFormatter(formatter)
+        root.addHandler(console)
 
     _ring.setFormatter(formatter)
     root.addHandler(_ring)

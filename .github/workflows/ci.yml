@@ -34,6 +34,11 @@ jobs:
             bash -n "$f" || exit 1
           done
 
+      - name: 日志轮转行为测试（shell）
+        # 从 cmd/main 提取真实 trim_log 函数执行：验证原地重写、保留尾部、
+        # 以及轮转后 O_APPEND 写入方仍能写入（回归 mv/rename 实现）
+        run: bash tests/test_logrotate_shell.sh
+
       - name: JSON 配置可解析
         run: |
           python3 - <<'PY'

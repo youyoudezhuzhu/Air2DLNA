@@ -37,7 +37,7 @@ iPhone / iPad / Mac
 
 ```bash
 # 在飞牛 NAS 上（应用中心也可直接手动安装 .fpk）
-appcenter-cli install-fpk Air2DLNA-1.0.0.fpk --volume 1
+appcenter-cli install-fpk Air2DLNA-1.0.1.fpk --volume 1
 appcenter-cli start air2dlna
 ```
 
@@ -108,7 +108,7 @@ airplay2-dlna-bridge/
 ```bash
 ./scripts/build.sh              # 全量构建（约 5–10 分钟）
 ./scripts/build.sh --skip-native  # 只重新打包
-# 产物：dist/Air2DLNA-1.0.0.fpk
+# 产物：dist/Air2DLNA-1.0.1.fpk
 ```
 
 脚本会：安装构建依赖 → 下载并**解包**（不安装）Avahi 开发文件 → 构建最小化静态
@@ -145,10 +145,20 @@ Play → WAV 头与 PCM 内容校验 → 音量映射 → 暂停/恢复 → Seek
 | 内容 | 路径 |
 |---|---|
 | 配置 | `/vol1/@appconf/air2dlna/config.json` |
-| 主日志 | `/vol1/@appdata/air2dlna/bridge.log` |
+| 应用日志（结构化，带轮转） | `/vol1/@appdata/air2dlna/bridge.log` |
+| 生命周期日志 | `/vol1/@appdata/air2dlna/main.log` |
+| 进程 stdout/stderr（启动异常兜底） | `/vol1/@appdata/air2dlna/bridge-stderr.log` |
 | 接收器日志 | `/vol1/@appdata/air2dlna/shairport-sync.log` |
 | 时钟守护进程日志 | `/vol1/@appdata/air2dlna/nqptp.log` |
 | PCM / 元数据 FIFO | `/vol1/@appdata/air2dlna/{audio,metadata}.fifo` |
+
+**日志不会无限增长**：所有日志都有上限 —— 单个文件超过 **5 MB** 时自动只保留
+**尾部 1 MB**（原地重写，对正在写入的进程完全无感）。
+
+- `bridge.log`：标准库 `RotatingFileHandler`（5 MB × 5 个备份）
+- `main.log` / `bridge-stderr.log`：启动与停止时轮转，并由 nqptp 看护脚本每 60 秒检查
+- `shairport-sync.log`：由进程监管循环每 60 秒检查
+- `nqptp.log`：由看护脚本每 60 秒检查
 
 升级**不会**删除配置；卸载时可在向导里选择保留或删除。
 

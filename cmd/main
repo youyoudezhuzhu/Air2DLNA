@@ -25,11 +25,16 @@ RUN_USER="${TRIM_USERNAME:-air2dlna}"
 APPVER="${TRIM_APPVER:-1.0.0}"
 
 MAIN_LOG="$VAR/main.log"
+BRIDGE_STDERR_LOG="$VAR/bridge-stderr.log"
 BRIDGE_PID="$VAR/app.pid"
 NQPTP_PID="$VAR/nqptp.pid"
 SHAIRPORT_PID="$VAR/shairport-sync.pid"
 WATCHDOG_PID="$VAR/nqptp-watchdog.pid"
 STOP_FILE="$VAR/nqptp-watchdog.stop"
+
+# 单个日志文件上限与超限后保留的尾部长度（与 supervisor.py 的常量保持一致）
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-5242880}"    # 5 MiB
+LOG_KEEP_BYTES="${LOG_KEEP_BYTES:-1048576}"  # 1 MiB
 
 BRIDGE="$APP/server/bridge.py"
 UI_DIR="$APP/ui"
@@ -57,6 +62,26 @@ fail() {
     log_msg "ERROR: $*"
     echo "$*" > "${TRIM_TEMP_LOGFILE:-/dev/stderr}"
     exit 1
+}
+
+# 日志轮转：超过上限时只保留尾部，避免 main.log / bridge-stderr.log 无上限增长。
+# **必须原地重写（不能 mv）**：写入方（bridge 的 stdout/stderr、watchdog 的 >>）
+# 以 O_APPEND 持有文件描述符，mv 之后它们会继续写进已改名的旧 inode，
+# 新文件永远收不到新内容。
+trim_log() {
+    local file="$1" size tmp
+    [ -f "$file" ] || return 0
+    size="$(stat -c %s "$file" 2>/dev/null || echo 0)"
+    case "$size" in ''|*[!0-9]*) return 0 ;; esac
+    [ "$size" -le "$LOG_MAX_BYTES" ] && return 0
+    tmp="$file.rotate.tmp"
+    if tail -c "$LOG_KEEP_BYTES" "$file" > "$tmp" 2>/dev/null; then
+        if cat "$tmp" > "$file" 2>/dev/null; then
+            log_msg "[logrotate] 日志超过 $((LOG_MAX_BYTES / 1048576))MB（原 $size 字节），已保留尾部 $((LOG_KEEP_BYTES / 1024))KB: $(basename "$file")"
+        fi
+    fi
+    rm -f "$tmp" 2>/dev/null
+    return 0
 }
 
 check_pid() {
@@ -173,11 +198,14 @@ start_bridge() {
     rm -f "$GATEWAY_SOCKET" 2>/dev/null || true
 
     : >> "$MAIN_LOG"
+    : >> "$BRIDGE_STDERR_LOG"
     # 注意：不能用 `nohup run_as_app_user ...` —— nohup 是外部命令，看不见 shell 函数。
     # 这里在子 shell 内直接调用函数；函数末尾用 exec 替换自身，因此 $! 就是最终 PID。
+    # stdout/stderr 写进独立的 bridge-stderr.log（而非 main.log）：main.log 只保留
+    # 生命周期事件，两者都有上限；桥接自身的结构化日志在 bridge.log（带轮转）。
     (
         exec </dev/null
-        exec >>"$MAIN_LOG" 2>&1
+        exec >>"$BRIDGE_STDERR_LOG" 2>&1
         run_as_app_user "$PYTHON" "$BRIDGE" \
             --config-dir "$ETC" \
             --var-dir "$VAR" \
@@ -246,6 +274,9 @@ stop_bridge() {
 # ---------------------------------------------------------------- 命令
 do_start() {
     preflight
+    # 启动前先给日志收口，避免长期运行后无限增长
+    trim_log "$MAIN_LOG"
+    trim_log "$BRIDGE_STDERR_LOG"
     if check_pid "$(read_pid "$BRIDGE_PID" || true)" && health_check; then
         log_msg "服务已在运行，跳过启动"
         return 0
@@ -267,6 +298,9 @@ do_stop() {
     log_msg "开始停止 Air2DLNA"
     stop_bridge
     stop_nqptp_watchdog
+    # 停止后写入方已关闭，此时轮转最安全
+    trim_log "$MAIN_LOG"
+    trim_log "$BRIDGE_STDERR_LOG"
     log_msg "停止完成"
     return 0
 }
