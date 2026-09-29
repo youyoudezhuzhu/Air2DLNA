@@ -163,6 +163,12 @@ class StreamSession:
     #: 诊断：本 token 被拉取的次数与最近一次 Range 起点（HTTP 层细节，不触发换代）
     range_requests: int = 0
     last_range_info: str = ""
+    #: 暂停恢复（方案 A）：待把「逻辑字节 0」映射到的实际环形偏移。
+    #: 仅在 pause recovery 期间由控制器设置；渲染器重连请求 Range: bytes=0- 时，
+    #: 服务端从该偏移开始发送 PCM（它以为自己从头播，实际听到的是暂停位置之后的音频）。
+    recovery_byte_offset: Optional[int] = None
+    #: 该映射是否已经真正生效过（用于判定恢复成功）
+    recovery_applied: bool = False
 
     @property
     def byte_rate(self) -> int:
@@ -299,9 +305,20 @@ class StreamManager:
         )
         with self._lock:
             session.clients += 1
+        # 暂停恢复（方案 A）：只在「逻辑 0 点」上做映射，且必须由控制器显式开启。
+        # 正常的 Range 请求（含正常播放期间的重连）行为完全不变。
+        mapped_offset: Optional[int] = None
+        if range_start == 0 and session.recovery_byte_offset is not None:
+            mapped_offset = session.recovery_byte_offset
+            session.recovery_applied = True
+            seconds = mapped_offset / float(session.byte_rate or 1)
+            log.info(
+                "暂停恢复映射生效: token=%s gen=%d 逻辑 Range 0 -> 实际环形偏移 %d 字节 (%.1fs)",
+                session.token, session.generation, mapped_offset, seconds,
+            )
         try:
-            offset = range_start
-            if session.kind == "wav" and offset == 0 and not head_only:
+            offset = mapped_offset if mapped_offset is not None else range_start
+            if session.kind == "wav" and range_start == 0 and not head_only:
                 wfile.write(build_wav_header(session.total_bytes, session.sample_rate,
                                              session.channels, session.bits))
                 wfile.flush()
@@ -313,7 +330,8 @@ class StreamManager:
             chunk_size = 32 * 1024
             last_progress = time.monotonic()
             while not session.closed:
-                if range_start == 0 and session.bytes_served == 0:
+                # 注意：有暂停恢复映射时不要把 offset 重置回 0（否则又会从本代起点播）
+                if mapped_offset is None and range_start == 0 and session.bytes_served == 0:
                     offset = 0
                 if session.total_bytes is not None and session.bytes_served >= session.total_bytes:
                     break

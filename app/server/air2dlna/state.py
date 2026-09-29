@@ -111,6 +111,12 @@ class BridgeController:
     REBUILD_COOLDOWN_SECONDS = 10.0
     #: 诊断日志输出间隔（秒）
     DIAGNOSTIC_INTERVAL_SECONDS = 15.0
+    #: 「暂停恢复」（方案 A）等待渲染器自己重连 HTTP 的窗口（秒）。
+    #: 真机实测小爱音箱把 UPnP Pause 执行成 Stop，Stop 后只发 Play 会"假播放"
+    #: （报告 PLAYING、继续拉流、但无声），必须靠它自己重新 GET（Range: bytes=0-）
+    #: 重新建立音频管线。窗口内把「逻辑 0 点」映射到暂停位置即可有声且不掉位置；
+    #: 窗口内没等到就 fallback 换代重建，避免卡死。
+    PAUSE_RECOVERY_TIMEOUT_SECONDS = 8.0
     #: 判定「渲染器时钟速率异常」的相对偏差容差（ΔRelTime / ΔAirPlay）。
     #: 采样粒度是 1 秒，正常读数本就有 ±0.3 量级抖动，容差太小会被噪声淹没。
     RELTIME_RATE_TOLERANCE = 0.20
@@ -169,6 +175,14 @@ class BridgeController:
         self._rel_rate_warned_at = 0.0
         #: 进入过渡态 / 暂停那一刻的曲目位置，用于判断 pbeg 时的位置连续性
         self._position_at_stream_boundary: Optional[float] = None
+        #: 暂停恢复（方案 A）：暂停位置及其在当代流内的字节偏移
+        self._pause_recovery_pending = False
+        self._pause_recovery_deadline = 0.0
+        self._paused_airplay_position_ms: Optional[float] = None
+        self._paused_ring_offset: Optional[int] = None
+        self._paused_generation = 0
+        self._paused_at = 0.0
+        self._pause_fallback_reason = ""
         #: 最近一次因真实 seek 换代的时刻
         self._handled_seek_at = 0.0
         self._last_range_info = ""
@@ -333,6 +347,9 @@ class BridgeController:
                 # 旧数据，且漂移基准（代偏移）没有更新，会立刻再次触发重建。
                 self._begin_new_generation(reason="resume-rebuild", offset_ms=None)
                 self._start_dlna_session(reason="resume-rebuild")
+            elif token and self._start_pause_recovery():
+                # 方案 A 已启动：等待渲染器自己重连（Range 0 会被映射到暂停位置）
+                return
             elif token:
                 # 暂停恢复 = 同一个播放位置的继续：只发 Play，**绝不重设 URI**。
                 # 真机上渲染器收到 Pause 后会自行转入 STOPPED（诊断日志可见
@@ -367,6 +384,131 @@ class BridgeController:
         self._uri_count = 0
         self._begin_new_generation(reason="pbeg", offset_ms=None)
         self._start_dlna_session(reason="pbeg")
+
+    def _position_to_ring_offset(self, position_ms: Optional[float]) -> Optional[int]:
+        """把「曲目位置」换算成当代流内的字节偏移（本代第 0 字节 = 代偏移）。"""
+        if position_ms is None:
+            return None
+        try:
+            base = self.timeline.generation_offset_ms
+            byte_rate = self.ring.byte_rate
+        except Exception:  # noqa: BLE001
+            return None
+        delta_ms = position_ms - base
+        if delta_ms <= 0:
+            return 0
+        return int(delta_ms / 1000.0 * byte_rate)
+
+    def _ring_window_text(self) -> str:
+        """环形缓冲当前可用的数据窗口（诊断/日志用）。"""
+        try:
+            byte_rate = float(self.ring.byte_rate or 1)
+            newest = self.ring.write_offset
+            capacity_bytes = int(self.ring.capacity_seconds * self.ring.byte_rate)
+            oldest = max(0, newest - capacity_bytes)
+        except Exception:  # noqa: BLE001
+            return "ring=?"
+        return "ring=[%.1fs,%.1fs]" % (oldest / byte_rate, newest / byte_rate)
+
+    def _pause_position_available(self) -> bool:
+        """暂停位置是否仍在环形缓冲窗口内（超出就只能 fallback 换代）。"""
+        with self._lock:
+            offset = self._paused_ring_offset
+        if offset is None:
+            return False
+        try:
+            byte_rate = self.ring.byte_rate
+            newest = self.ring.write_offset
+            oldest = max(0, newest - int(self.ring.capacity_seconds * byte_rate))
+        except Exception:  # noqa: BLE001
+            return False
+        return oldest <= offset <= newest
+
+    def _start_pause_recovery(self) -> bool:
+        """尝试「方案 A」：保持 generation / URI 不变，让渲染器自己重连 HTTP。
+
+        真机实测：小爱音箱把 UPnP ``Pause`` 执行成了 ``Stop``，而 ``Stop`` 后只发
+        ``Play`` 会产生"假播放"（报告 PLAYING、继续拉流、但无声）；只有
+        ``SetAVTransportURI`` 能让音频管线重新激活，代价是从资源 0 点重播。
+        本方案利用它 ``Stop`` 后会**自己重连 HTTP 并请求 ``Range: bytes=0-``** 的行为：
+        恢复期间服务端把「逻辑 0 点」映射到暂停位置 —— 它以为自己从头播，
+        实际听到的正是暂停位置之后的音频。
+
+        返回 True 表示方案 A 已启动（调用方不要再换代/重设 URI）。
+        """
+        with self._lock:
+            pending = self._pause_recovery_pending
+            token = self._gen_token
+            offset = self._paused_ring_offset
+            position = self._paused_airplay_position_ms
+            generation = self._paused_generation
+        if not pending or not token or offset is None:
+            return False
+        session = self.streams.get(token)
+        if session is None or session.closed or session.generation != generation:
+            self._pause_fallback_reason = "会话缺失或已换代"
+            log.info("暂停恢复: 当前会话不可用（%s），不启用方案 A", self._pause_fallback_reason)
+            return False
+        if not self._pause_position_available():
+            self._pause_fallback_reason = "暂停位置超出缓冲窗口"
+            log.info("暂停恢复: 暂停位置已超出环形缓冲窗口（%s），fallback 换代重建",
+                     self._ring_window_text())
+            return False
+
+        session.recovery_byte_offset = offset
+        session.recovery_applied = False
+        with self._lock:
+            self._pause_recovery_deadline = time.monotonic() + self.PAUSE_RECOVERY_TIMEOUT_SECONDS
+        log.info(
+            "暂停恢复: 启动方案 A（不换代、不换 URI、不 SetAVTransportURI）"
+            "gen=%d paused_pos=%s ms 映射偏移=%d 字节 %s 超时=%.1fs",
+            generation, int(position) if position is not None else "-",
+            offset, self._ring_window_text(), self.PAUSE_RECOVERY_TIMEOUT_SECONDS)
+        # 只发 Play：让渲染器从 STOPPED 回到 PLAYING 并自行重连 HTTP
+        self._set_intent(_MODE_PLAY, token, set_uri=False)
+        return True
+
+    def _check_pause_recovery(self) -> None:
+        """方案 A 收尾：成功判定 / 超时 fallback。"""
+        with self._lock:
+            deadline = self._pause_recovery_deadline
+            if deadline <= 0.0:
+                return
+            token = self._gen_token
+        session = self.streams.get(token) if token else None
+        if session is not None and session.recovery_applied and session.clients > 0:
+            session.recovery_byte_offset = None
+            with self._lock:
+                self._pause_recovery_deadline = 0.0
+                self._pause_recovery_pending = False
+            log.info("暂停恢复: 成功 —— 渲染器已使用 Range 0 映射并在拉流，"
+                     "位置即暂停位置，未换代、未换 URI")
+            return
+        if time.monotonic() < deadline:
+            return
+        with self._lock:
+            self._pause_recovery_deadline = 0.0
+            self._pause_recovery_pending = False
+            self._pause_fallback_reason = "等待渲染器重连超时"
+        log.warning(
+            "暂停恢复: 超时（%.1fs 内渲染器没有使用 Range 0 映射），fallback 换代重建 "
+            "—— 新 generation 的 0 点 = 当前 AirPlay 位置，不会回退到旧位置",
+            self.PAUSE_RECOVERY_TIMEOUT_SECONDS)
+        if session is not None:
+            session.recovery_byte_offset = None
+        self._begin_new_generation(reason="pause-recovery-fallback", offset_ms=None)
+        self._start_dlna_session(reason="pause-recovery-fallback")
+
+    def _clear_pause_recovery(self, reason: str) -> None:
+        """清除暂停恢复状态（seek / 播放结束等场景）。"""
+        with self._lock:
+            had = self._pause_recovery_pending or self._pause_recovery_deadline > 0.0
+            self._pause_recovery_pending = False
+            self._pause_recovery_deadline = 0.0
+            self._paused_ring_offset = None
+            self._paused_airplay_position_ms = None
+        if had:
+            log.debug("清除暂停恢复状态（%s）", reason)
 
     def _can_reuse_generation(self) -> bool:
         """``pbeg`` 时判断能否沿用当前 DLNA 会话。
@@ -405,10 +547,20 @@ class BridgeController:
 
     def _handle_pause(self) -> None:
         """``paus``：暂停。优先用 UPnP Pause（不换代、不 flush，恢复即可继续）。"""
-        log.info("AirPlay 暂停：向渲染器发送 Pause（沿用当前 DLNA 会话 gen=%d）",
-                 self.ring.generation)
+        position = self.timeline.position_ms()
+        offset = self._position_to_ring_offset(position)
         with self._lock:
-            self._position_at_stream_boundary = self.timeline.position_ms()
+            self._position_at_stream_boundary = position
+            self._paused_airplay_position_ms = position
+            self._paused_ring_offset = offset
+            self._paused_generation = self.ring.generation
+            self._paused_at = time.monotonic()
+        log.info(
+            "AirPlay 暂停：向渲染器发送 Pause（沿用当前 DLNA 会话 gen=%d）"
+            "；暂停恢复信息 airplay_pos=%s ms ring_offset=%s 字节 %s",
+            self.ring.generation,
+            int(position) if position is not None else "-",
+            offset if offset is not None else "-", self._ring_window_text())
         self.timeline.on_pause()
         with self._lock:
             self.state.state = PAUSED
@@ -421,6 +573,7 @@ class BridgeController:
         flush 旧 PCM → 新 generation → 新 token/URI → SetAVTransportURI → Play。
         """
         self._cancel_transition("seek/flush")
+        self._clear_pause_recovery("seek")
         self._handled_seek_at = time.monotonic()
         log.info("检测到 seek/flush (frame=%s)：换代并重锚 DLNA 会话", payload or "?")
         self._begin_new_generation(reason="flush", offset_ms=None)
@@ -493,6 +646,7 @@ class BridgeController:
         with self._lock:
             self._awaiting_new_stream = False
             self._transition_deadline = 0.0
+        self._clear_pause_recovery("播放结束")
         self._session_started_at = 0.0
         self._rel_sample = None
         self._rel_offset_ms = None
@@ -842,6 +996,8 @@ class BridgeController:
                 self._renew_subscriptions_if_due()
                 # pend 过渡窗口到期检查（不依赖渲染器是否可达）
                 self._check_transition_timeout()
+                # 暂停恢复（方案 A）的成功判定 / 超时 fallback
+                self._check_pause_recovery()
                 self._log_diagnostics()
             except Exception:  # noqa: BLE001
                 log.exception("位置轮询异常")
@@ -892,6 +1048,18 @@ class BridgeController:
                 self.state.state = PAUSED
         self._action_errors = 0
 
+        # 渲染器把 Pause 实现成了 Stop（真机实测）：标记「待暂停恢复」，
+        # Resume 时优先走方案 A（等它自己重连 HTTP，把逻辑 0 点映射到暂停位置）。
+        if (renderer_state == _RENDERER_STOPPED
+                and self.state.state == PAUSED
+                and self._paused_ring_offset is not None
+                and not self._pause_recovery_pending
+                and self._paused_generation == self.ring.generation):
+            with self._lock:
+                self._pause_recovery_pending = True
+            log.info("暂停恢复: 检测到渲染器实际为 STOPPED（固件把 Pause 实现成 Stop）"
+                     "，已标记待恢复；Resume 时将优先尝试「重连 Range 0 → 映射到暂停位置」")
+
         if renderer_state in (_RENDERER_PLAYING, _RENDERER_PAUSED):
             try:
                 position = client.get_position_info()
@@ -922,6 +1090,9 @@ class BridgeController:
         （GetTransportInfo 仍回报 PLAYING），只能自己检查有没有客户端在拉流，
         随后重建会话把它拉回来。
         """
+        if self._pause_recovery_pending:
+            # 方案 A 进行中：渲染器可能刚 STOPPED、正准备重连，绝不能被兜底重建打断
+            return
         if self.state.state != PLAYING or not self._renderer_token:
             return
         session = self.streams.get(self._renderer_token)
@@ -997,7 +1168,7 @@ class BridgeController:
         log.info(
             "诊断: airplay_pos=%s state=%s renderer=%s rel_time=%s offset=%s rate=%s "
             "gen=%s token=%s http_clients=%s bytes_served=%s last_range=%s "
-            "idle=%.1fs uri_count=%d last_rebuild=%s awaiting_new_stream=%s",
+            "idle=%.1fs uri_count=%d last_rebuild=%s awaiting_new_stream=%s pause_recovery=%s",
             int(self.timeline.position_ms()) if self.timeline.position_ms() is not None else "-",
             state_name, renderer_state,
             int(self.timeline.renderer_rel_time_ms) if self.timeline.renderer_rel_time_ms is not None else "-",
@@ -1009,6 +1180,8 @@ class BridgeController:
             self._last_range_info or "-",
             (now - session.last_activity) if session is not None and session.last_activity else -1.0,
             self._uri_count, self._last_rebuild_reason or "-", self._awaiting_new_stream,
+            ("active" if self._pause_recovery_deadline > 0.0
+             else ("armed" if self._pause_recovery_pending else "-")),
         )
 
     def _sync_positions(self) -> None:

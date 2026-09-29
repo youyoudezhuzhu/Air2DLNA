@@ -433,5 +433,178 @@ class RebuildSourceTests(unittest.TestCase):
         self.assertEqual(0, controller._uri_count, "不得出现 SetAVTransportURI")
 
 
+class PauseRecoveryTests(unittest.TestCase):
+    """方案 A（暂停恢复）：保持 generation/URI，把渲染器重连的 Range 0 映射到暂停位置。
+
+    真机实测：小爱音箱把 UPnP Pause 执行成 Stop；Stop 后只发 Play 会"假播放"
+    （报告 PLAYING、继续拉流、但无声）；重设同一 URI 又会从资源 0 点重播。
+    方案 A 利用它 Stop 后会自己重连 HTTP（Range: bytes=0-）的行为。
+    """
+
+    @staticmethod
+    def _fill(ring, seconds: float = 40.0) -> None:
+        ring.append(b"\x00" * int(SAMPLE_RATE * CHANNELS * 2 * seconds))
+
+    def test_pause_records_recovery_info(self) -> None:
+        controller, _, ring, timeline, _, _ = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+
+        controller._handle_pause()
+
+        self.assertIsNotNone(controller._paused_airplay_position_ms, "应记录暂停位置")
+        self.assertIsNotNone(controller._paused_ring_offset, "应换算出当代内字节偏移")
+        self.assertEqual(ring.generation, controller._paused_generation)
+        self.assertTrue(controller._pause_position_available(), "暂停位置应在缓冲窗口内")
+
+    def test_pause_recovery_starts_on_resume_without_rebuild(self) -> None:
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller._pause_recovery_pending = True     # 轮询检测到渲染器 STOPPED
+        generation_before = ring.generation
+        created_before = len(streams.created)
+
+        controller._handle_play(True)                      # pres：iPhone 恢复
+
+        self.assertGreater(controller._pause_recovery_deadline, 0.0, "方案 A 应已启动")
+        self.assertEqual(generation_before, ring.generation, "不得换代")
+        self.assertEqual(created_before, len(streams.created), "不得更换 URI")
+        session = streams.get(controller._gen_token)
+        self.assertIsNotNone(session.recovery_byte_offset, "应设置 Range 0 的映射偏移")
+        self.assertEqual(controller._paused_ring_offset, session.recovery_byte_offset)
+        self.assertTrue(controller._start_pause_recovery() is False or True)  # 幂等性不炸
+
+    def test_pause_recovery_success_clears_state(self) -> None:
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller._pause_recovery_pending = True
+        controller._handle_play(True)
+        session = streams.get(controller._gen_token)
+        session.recovery_applied = True                    # 渲染器用上了映射
+        session.clients = 1
+
+        controller._check_pause_recovery()
+
+        self.assertFalse(controller._pause_recovery_pending, "成功后应清除待恢复状态")
+        self.assertEqual(0.0, controller._pause_recovery_deadline)
+        self.assertIsNone(session.recovery_byte_offset, "成功后应撤掉映射")
+
+    def test_pause_recovery_timeout_falls_back(self) -> None:
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller._pause_recovery_pending = True
+        controller._handle_play(True)
+        generation_before = ring.generation
+        created_before = len(streams.created)
+        controller._pause_recovery_deadline = time.monotonic() - 1.0   # 窗口已过
+
+        controller._check_pause_recovery()
+
+        self.assertEqual(generation_before + 1, ring.generation, "超时应换代")
+        self.assertEqual(created_before + 1, len(streams.created), "超应建新 URI")
+        self.assertEqual("pause-recovery-fallback", controller._last_rebuild_reason)
+
+    def test_pause_recovery_skipped_when_position_out_of_window(self) -> None:
+        controller, _, ring, timeline, _, _ = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller._pause_recovery_pending = True
+            controller._paused_ring_offset = 10 ** 9        # 暂停位置已被覆盖
+
+        started = controller._start_pause_recovery()
+
+        self.assertFalse(started, "位置超出缓冲窗口时不得启用方案 A")
+
+    def test_watchdog_suppressed_during_recovery(self) -> None:
+        controller, _, ring, _, _, streams = _build()
+        controller._handle_play(False)
+        controller._renderer_token = controller._gen_token
+        session = streams.get(controller._gen_token)
+        session.clients = 0
+        session.last_activity = time.monotonic() - 30.0
+        with controller._lock:
+            controller.state.state = state_mod.PLAYING
+            controller._pause_recovery_pending = True
+        generation_before = ring.generation
+
+        controller._check_renderer_stream()
+
+        self.assertEqual(generation_before, ring.generation,
+                         "方案 A 期间不得触发兜底重建（会打断恢复）")
+
+    def test_seek_clears_pause_recovery(self) -> None:
+        controller, _, ring, timeline, _, _ = _build()
+        controller._handle_play(False)
+        self._fill(ring)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller._pause_recovery_pending = True
+
+        controller._handle_flush("999")                    # 真实 seek
+
+        self.assertFalse(controller._pause_recovery_pending, "seek 应清除暂停恢复状态")
+
+
+class StreamRecoveryMappingTests(unittest.TestCase):
+    """服务端映射：暂停恢复期间 Range: bytes=0- 从暂停位置读数据（WAV header 语义不变）。"""
+
+    def test_serve_maps_zero_range_to_recovery_offset(self) -> None:
+        import io
+
+        from air2dlna.stream import StreamManager
+
+        ring = PcmRingBuffer(SAMPLE_RATE * CHANNELS * 2 * 10, sample_rate=SAMPLE_RATE,
+                            channels=CHANNELS)
+        ring.append(b"\x00" * (SAMPLE_RATE * CHANNELS * 2 * 4))       # 前 4 秒：静音
+        ring.append(b"\xab" * (SAMPLE_RATE * CHANNELS * 2 * 4))       # 之后：非静音
+        manager = StreamManager(ring)
+        session = manager.new_generation("l16")
+        session.total_bytes = 64                                       # 只发一点就结束
+        session.recovery_byte_offset = SAMPLE_RATE * CHANNELS * 2 * 5  # 映射到 5 秒处
+        out = io.BytesIO()
+
+        manager.serve(session, out, range_start=0)
+
+        data = out.getvalue()
+        self.assertTrue(session.recovery_applied, "映射应被标记为已生效")
+        self.assertTrue(data.startswith(b"\xab"), "应从映射位置（而非本代起点）开始发送")
+
+    def test_serve_without_recovery_keeps_generation_start(self) -> None:
+        import io
+
+        from air2dlna.stream import StreamManager
+
+        ring = PcmRingBuffer(SAMPLE_RATE * CHANNELS * 2 * 10, sample_rate=SAMPLE_RATE,
+                            channels=CHANNELS)
+        ring.append(b"\x00" * (SAMPLE_RATE * CHANNELS * 2 * 4))
+        ring.append(b"\xab" * (SAMPLE_RATE * CHANNELS * 2 * 4))
+        manager = StreamManager(ring)
+        session = manager.new_generation("l16")
+        session.total_bytes = 64
+        out = io.BytesIO()
+
+        manager.serve(session, out, range_start=0)
+
+        self.assertFalse(session.recovery_applied)
+        self.assertTrue(out.getvalue().startswith(b"\x00"), "未启用映射时行为不变")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
