@@ -99,6 +99,7 @@ print(json.dumps({'tag_name': sys.argv[1], 'name': sys.argv[1],
           '**安装**：应用中心 →「手动安装」选择本页的 .fpk，或\\n'
           '`appcenter-cli install-fpk AirPlay2-DLNA-Bridge-1.0.0.fpk --volume 1`\\n\\n'
           '依赖应用中心的 Python 3.12（python312）。不需要 Docker。',
+          '\\n\\n**SHA-256**：`' + sha + '`  (' + size + ' bytes)',
   'draft': False, 'prerelease': False}))" "$TAG")" \
         | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
     fi
