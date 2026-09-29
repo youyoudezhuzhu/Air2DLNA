@@ -312,6 +312,19 @@ class PendTransitionTests(unittest.TestCase):
         self.assertAlmostEqual(120000.0, timeline.generation_offset_ms, delta=1000.0,
                                msg="prgr 到达后代偏移应被修正为真实位置")
 
+    def test_resume_intent_forbids_set_uri(self) -> None:
+        """pres（暂停恢复）路径也不得允许重设 URI。
+
+        真机走的就是这条分支（AirPlay 2 暂停恢复发 `pres`）：渲染器收到 Pause 后
+        自行转入 STOPPED，若此时重设 URI 就会从资源开头播放。
+        """
+        controller, _, ring, _, _, _ = _build()
+        controller._handle_play(False)
+        controller._handle_play(True)          # pres：暂停恢复
+
+        self.assertFalse(controller._intent.set_uri, "暂停恢复不得允许重设 URI")
+        self.assertEqual(state_mod._MODE_PLAY, controller._intent.mode)
+
     def test_reuse_path_never_resets_uri(self) -> None:
         """复用同一个 generation 时只能发 Play —— 重设 URI 会让渲染器从头播放。"""
         controller, _, ring, timeline, _, streams = _build()

@@ -334,8 +334,15 @@ class BridgeController:
                 self._begin_new_generation(reason="resume-rebuild", offset_ms=None)
                 self._start_dlna_session(reason="resume-rebuild")
             elif token:
-                log.info("恢复播放：向渲染器发送 Play")
-                self._set_intent(_MODE_PLAY, token)
+                # 暂停恢复 = 同一个播放位置的继续：只发 Play，**绝不重设 URI**。
+                # 真机上渲染器收到 Pause 后会自行转入 STOPPED（诊断日志可见
+                # state=PAUSED renderer=STOPPED）。此时若下发 SetAVTransportURI，
+                # DLNA 语义会让它从该资源**开头**重新播放 —— 这正是「暂停后恢复
+                # 变成从头播放」的直接原因（1.0.8 只改了 pbeg 分支，而真机走的是
+                # 这里的 pres/resume 分支）。
+                log.info("恢复播放：向渲染器发送 Play（沿用当前 DLNA 会话 gen=%d，不重设 URI）",
+                         self.ring.generation)
+                self._set_intent(_MODE_PLAY, token, set_uri=False)
             else:
                 self._start_dlna_session(reason="resume")
             return
