@@ -109,29 +109,72 @@ trap - EXIT INT TERM
 
 if [ -f "$FPK" ]; then
     echo "==> 建立 Release $TAG 并上传 $(basename "$FPK")"
-    RELEASE_ID="$(api GET "/repos/$REPO/releases/tags/$TAG" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))' 2>/dev/null || true)"
+    SHA="$(sha256sum "$FPK" | cut -d' ' -f1)"
+    SIZE="$(stat -c %s "$FPK")"
+    ASSET="$(basename "$FPK")"
+
+    BODY_FILE="$(mktemp)"
+    cat > "$BODY_FILE" <<BODY_EOF
+飞牛 OS 原生 AirPlay 2 → DLNA 桥接应用（不使用 Docker）。
+
+## 安装
+1. 应用中心 →「手动安装」→ 选择本页的 \`.fpk\`；或
+2. \`\`\`bash
+   appcenter-cli install-fpk $ASSET --volume 1
+   appcenter-cli start airplay2dlna
+   \`\`\`
+
+依赖：应用中心的 **Python 3.12**（\`python312\`，安装时自动准备）。
+
+安装后在 Web UI（\`http://<NAS_IP>:8788\`）里设置 AirPlay 名称并选择 DLNA 音响。
+真机验收清单见仓库 \`docs/ACCEPTANCE.md\`。
+
+## 校验
+- 文件：\`$ASSET\`
+- 体积：\`$SIZE\` 字节
+- SHA-256：\`$SHA\`
+
+> 重建：\`./scripts/build.sh\`（需要 fnpack）。CI 也会跑单元测试与端到端集成测试。
+BODY_EOF
+
+    RELEASE_ID="$(api GET "/repos/$REPO/releases/tags/$TAG" 2>/dev/null \
+        | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("id","") or "")
+except Exception: print("")' || true)"
+
     if [ -z "$RELEASE_ID" ]; then
-        RELEASE_ID="$(api POST "/repos/$REPO/releases" "$(python3 -c "
-import json,sys
-print(json.dumps({'tag_name': sys.argv[1], 'name': sys.argv[1],
-  'body': '飞牛 OS 原生 AirPlay 2 → DLNA 桥接应用。\\n\\n'
-          '**安装**：应用中心 →「手动安装」选择本页的 .fpk，或\\n'
-          '`appcenter-cli install-fpk AirPlay2-DLNA-Bridge-1.0.0.fpk --volume 1`\\n\\n'
-          '依赖应用中心的 Python 3.12（python312）。不需要 Docker。',
-          '\\n\\n**SHA-256**：`' + sha + '`  (' + size + ' bytes)',
-  'draft': False, 'prerelease': False}))" "$TAG")" \
-        | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+        JSON_FILE="$(mktemp)"
+        python3 -c 'import json,sys
+tag, body_path, out = sys.argv[1], sys.argv[2], sys.argv[3]
+body = open(body_path, encoding="utf-8").read()
+json.dump({"tag_name": tag, "name": tag, "body": body,
+           "draft": False, "prerelease": False}, open(out, "w", encoding="utf-8"))' \
+            "$TAG" "$BODY_FILE" "$JSON_FILE"
+        # 用 --data-binary 读取 JSON 文件，保留换行
+        RELEASE_ID="$(curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            --data-binary "@$JSON_FILE" \
+            "https://api.github.com/repos/$REPO/releases" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("id",""))')"
+        rm -f "$JSON_FILE"
+    else
+        echo "    Release $TAG 已存在，仅上传资产"
     fi
+    rm -f "$BODY_FILE"
+
     [ -n "$RELEASE_ID" ] || { echo "创建 Release 失败" >&2; exit 1; }
     curl -sS -X POST -H "Authorization: Bearer $GH_TOKEN" \
          -H "Content-Type: application/octet-stream" \
          --data-binary "@$FPK" \
-         "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$(basename "$FPK")" \
-         | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    上传完成:", d.get("browser_download_url", d))'
+         "https://uploads.github.com/repos/$REPO/releases/$RELEASE_ID/assets?name=$ASSET" \
+         | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+print("    上传完成:", d.get("browser_download_url") or d.get("message") or d)'
 else
     echo "    未找到 $FPK，跳过 Release（先运行 ./scripts/build.sh）"
 fi
 
 echo
-echo "完成：https://github.com/$REPO"
+echo "仓库：https://github.com/$REPO"
+echo "发布：https://github.com/$REPO/releases/tag/$TAG"
