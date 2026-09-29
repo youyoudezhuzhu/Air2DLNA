@@ -265,18 +265,69 @@ class PendTransitionTests(unittest.TestCase):
         self.assertEqual(0, controller._uri_count, "不得出现 SetAVTransportURI")
 
     def test_pbeg_with_jumped_position_rebuilds(self) -> None:
-        """换曲 / 跳到别处：位置真跳变时必须换代（否则音箱还在播旧位置的数据）。"""
+        """换曲 / 跳到别处：曲目位置真跳变时必须换代（否则音箱还在播旧位置的数据）。"""
         controller, _, ring, timeline, _, streams = _build()
         controller._handle_play(False)
         generation_before = ring.generation
         created_before = len(streams.created)
-        _observe(controller, timeline, 300.0, 1000.0)      # 渲染器才到 1 秒处 → 跳变 5 分钟
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_play_stream_end("播放流结束")     # 记录边界位置 30 秒
+        _observe(controller, timeline, 300.0, 1000.0)        # 位置跳到 300 秒（换曲）
 
         controller._handle_play(False)
 
         self.assertEqual(generation_before + 1, ring.generation, "位置跳变应换代")
         self.assertEqual(created_before + 1, len(streams.created), "应新建流 URI")
         self.assertEqual("pbeg", controller._last_rebuild_reason)
+
+    def test_pbeg_right_after_seek_does_not_rebuild_again(self) -> None:
+        """真实 seek 已经换代，紧随的 pbeg 不许再来一次（否则音箱重复缓冲）。"""
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_flush("12345")                    # 真实 seek → 换代
+
+        generation_after_seek = ring.generation
+        created_after_seek = len(streams.created)
+        controller._handle_play(False)                       # 紧随其后的 pbeg
+
+        self.assertEqual(generation_after_seek, ring.generation, "seek 后的 pbeg 不得再换代")
+        self.assertEqual(created_after_seek, len(streams.created), "不得再次更换 URI")
+
+    def test_generation_change_marks_pending_reanchor(self) -> None:
+        """换代后必须标记「基准待重锚」，等随后的 prgr 用真位置修正。
+
+        pbeg 换代时 prgr 往往还没到，基准会退化成 0 → 位置偏差恒等于曲目绝对位置
+        （真机实测 138 秒），既污染诊断也误导连续性判断。
+        """
+        controller, _, ring, timeline, _, streams = _build()
+        with controller._lock:
+            controller._pending_reanchor = False
+
+        controller._handle_play(False)                       # pbeg → 换代
+
+        self.assertTrue(controller._pending_reanchor, "换代后应标记基准待重锚")
+        _set_offset(timeline, 120.0)                         # 随后 prgr 上报真实位置
+        controller._after_progress()
+        self.assertAlmostEqual(120000.0, timeline.generation_offset_ms, delta=1000.0,
+                               msg="prgr 到达后代偏移应被修正为真实位置")
+
+    def test_reuse_path_never_resets_uri(self) -> None:
+        """复用同一个 generation 时只能发 Play —— 重设 URI 会让渲染器从头播放。"""
+        controller, _, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        record = controller.registry.selected()
+        client = record.client
+        calls: list[str] = []
+        client.play = lambda *a, **kw: (calls.append("play"), True)[1]
+        client.set_av_transport_uri = lambda *a, **kw: (calls.append("set_uri"), True)[1]
+        controller._renderer_token = controller._gen_token
+        with controller._lock:
+            controller.state.renderer_state = state_mod._RENDERER_STOPPED
+
+        controller._do_play(record, client, controller._gen_token, set_uri=False)
+
+        self.assertEqual(["play"], calls, "复用路径只能发 Play，绝不能重设 URI")
 
     def test_pcm_resumes_cancel_transition(self) -> None:
         controller, _, _, _, _, _ = _build()

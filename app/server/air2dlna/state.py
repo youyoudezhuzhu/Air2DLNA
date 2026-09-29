@@ -90,6 +90,10 @@ class _Intent:
     token: str = ""          # 要播放的流 token
     volume: Optional[int] = None
     revision: int = 0
+    #: 是否允许由该意图触发 ``SetAVTransportURI``。
+    #: 复用同一个 generation 时必须为 False —— DLNA 语义下重设 URI 会让渲染器
+    #: 从该资源的**开头**重新播放（真机现象：「暂停后恢复变成从头播放」）。
+    set_uri: bool = True
 
 
 class BridgeController:
@@ -112,10 +116,15 @@ class BridgeController:
     RELTIME_RATE_TOLERANCE = 0.20
     #: 速率告警的最小间隔（秒）：真漂移会持续存在，不必每条采样都记
     RELTIME_RATE_WARN_INTERVAL = 60.0
-    #: ``pbeg`` 时判断「位置是否连续」的容差。AirPlay 2 在暂停恢复与 seek 后
-    #: 都会发 ``pend`` + ``pbeg``；位置连续说明是同一个播放位置的继续，
-    #: 必须沿用当前 generation（重建会让音箱重新缓冲/淡入 = 卡顿甚至停止）。
-    RESUME_POSITION_TOLERANCE_MS = 10000.0
+    #: ``pbeg`` 时判断「播放位置是否连续」的容差，比较的是**曲目位置本身的变化**
+    #: （暂停期间它几乎不动，seek 会跳变）。
+    #: 注意：不能用「AirPlay 位置 −（代偏移 + 渲染器 RelTime）」的绝对值当判据 ——
+    #: 那个量包含了渲染器缓冲延迟与代偏移误差，真机上可达几十秒，会把正常暂停
+    #: 误判成跳变（1.0.7 的 bug，导致暂停恢复后从头播）。
+    RESUME_POSITION_TOLERANCE_MS = 4000.0
+    #: 刚刚处理过真实 seek（``pfls``/``pdis``）的窗口（秒）。seek 已经换代了，
+    #: 紧随其后的 ``pbeg`` 不许再来一次（否则音箱重复缓冲）。
+    SEEK_REUSE_WINDOW_SECONDS = 10.0
 
     def __init__(self, config, registry, ring: PcmRingBuffer, timeline: AudioTimeline,
                  streams: stream.StreamManager, log=None) -> None:
@@ -158,6 +167,10 @@ class BridgeController:
         self._rel_rate: Optional[float] = None
         self._rel_observed_at = 0.0
         self._rel_rate_warned_at = 0.0
+        #: 进入过渡态 / 暂停那一刻的曲目位置，用于判断 pbeg 时的位置连续性
+        self._position_at_stream_boundary: Optional[float] = None
+        #: 最近一次因真实 seek 换代的时刻
+        self._handled_seek_at = 0.0
         self._last_range_info = ""
         self._last_diag_log = 0.0
         #: 每次 SetAVTransportURI 的序号与原因（验收要求：正常播放应该只有 1 次）
@@ -336,9 +349,9 @@ class BridgeController:
             # 此时音频数据是连续的，重建会话只会让音箱重新缓冲并淡入 ——
             # 真机表现就是卡顿甚至直接停止。这里沿用当前 generation，
             # 只确保渲染器处于播放状态（Play 是幂等的）。
-            log.info("pbeg：位置连续，沿用当前 DLNA 会话 gen=%d（不重建、不换 URI）",
+            log.info("pbeg：沿用当前 DLNA 会话 gen=%d（不重建、不重设 URI）",
                      self.ring.generation)
-            self._set_intent(_MODE_PLAY, self._gen_token)
+            self._set_intent(_MODE_PLAY, self._gen_token, set_uri=False)
             return
 
         # 真正的新播放位置（首次播放 / 换曲 / seek 到别处）才更换媒体生命周期。
@@ -351,29 +364,44 @@ class BridgeController:
     def _can_reuse_generation(self) -> bool:
         """``pbeg`` 时判断能否沿用当前 DLNA 会话。
 
-        判据是**位置连续性**：用最近一次观测到的
-        ``AirPlay 位置 −（代偏移 + 渲染器 RelTime）`` 偏差。暂停恢复 / seek 之后
-        继续播放时该偏差仍在缓冲延迟量级；而换曲或跳到别处（位置真跳变）会很大。
+        判据是**曲目位置本身是否连续** —— 暂停期间它几乎不动，换曲/跳到别处会大幅跳变。
+        不能用「AirPlay 位置 −（代偏移 + 渲染器 RelTime）」的绝对值当判据：那个量含
+        渲染器缓冲延迟与代偏移误差，真机可达几十秒，会把正常暂停误判成跳变
+        （1.0.7 的 bug：暂停恢复后每次都换代 → 从头播放）。
+
+        另外：若刚刚因真实 seek 换代过，紧随的 ``pbeg`` 直接沿用（seek 已换代）。
         """
         with self._lock:
             token = self._gen_token
             stopped = self.state.state == STOPPED
+            baseline = self._position_at_stream_boundary
         if stopped or not token:
             return False
         session = self.streams.get(token)
         if session is None or session.closed:
             return False
-        offset = self._rel_offset_ms
-        if offset is not None and abs(offset) > self.RESUME_POSITION_TOLERANCE_MS:
-            log.info("pbeg：位置偏差 %.0f ms（超出连续性容差 %.0f ms），按新的播放位置重建",
-                     offset, self.RESUME_POSITION_TOLERANCE_MS)
+        now = time.monotonic()
+        if now - self._handled_seek_at <= self.SEEK_REUSE_WINDOW_SECONDS:
+            log.info("pbeg：%.1fs 前刚处理过真实 seek（已换代），沿用当前 DLNA 会话",
+                     now - self._handled_seek_at)
+            return True
+        current = self.timeline.position_ms()
+        if baseline is None or current is None:
+            return True
+        delta = abs(current - baseline)
+        if delta > self.RESUME_POSITION_TOLERANCE_MS:
+            log.info("pbeg：曲目位置跳变 %.0f ms（容差 %.0f ms），按新的播放位置重建",
+                     delta, self.RESUME_POSITION_TOLERANCE_MS)
             return False
+        log.info("pbeg：曲目位置连续（变化 %.0f ms），沿用当前 DLNA 会话", delta)
         return True
 
     def _handle_pause(self) -> None:
         """``paus``：暂停。优先用 UPnP Pause（不换代、不 flush，恢复即可继续）。"""
         log.info("AirPlay 暂停：向渲染器发送 Pause（沿用当前 DLNA 会话 gen=%d）",
                  self.ring.generation)
+        with self._lock:
+            self._position_at_stream_boundary = self.timeline.position_ms()
         self.timeline.on_pause()
         with self._lock:
             self.state.state = PAUSED
@@ -386,6 +414,7 @@ class BridgeController:
         flush 旧 PCM → 新 generation → 新 token/URI → SetAVTransportURI → Play。
         """
         self._cancel_transition("seek/flush")
+        self._handled_seek_at = time.monotonic()
         log.info("检测到 seek/flush (frame=%s)：换代并重锚 DLNA 会话", payload or "?")
         self._begin_new_generation(reason="flush", offset_ms=None)
         with self._lock:
@@ -408,6 +437,8 @@ class BridgeController:
             self._awaiting_new_stream = True
             self._transition_deadline = time.monotonic() + self.PEND_TRANSITION_TIMEOUT_SECONDS
             self._transition_reason = reason
+            # 记下此刻的曲目位置：pbeg 到来时用它判断「是同一个位置继续」还是「跳变」
+            self._position_at_stream_boundary = self.timeline.position_ms()
         log.info(
             "AirPlay 播放流结束（%s）：进入过渡态，DLNA 会话保持不变；%.1fs 内没有新的流才真正停止",
             reason, self.PEND_TRANSITION_TIMEOUT_SECONDS)
@@ -513,6 +544,11 @@ class BridgeController:
                 log.debug("换代前钩子执行失败", exc_info=True)
         self._last_rebuild_reason = reason
         self._last_rebuild_at = time.monotonic()
+        with self._lock:
+            # 换代意味着「本代第 0 字节对应哪个曲目位置」需要重设。此刻 AirPlay 的
+            # prgr 往往还没到（pbeg 场景），基准会退化成 0/上一代的值；统一标记，
+            # 等随后的 prgr 用真位置修正（_after_progress → refine_generation_offset）。
+            self._pending_reanchor = True
         generation = self.ring.flush()
         kind, _content_type = "wav", "audio/wav"
         with self._lock:
@@ -523,10 +559,12 @@ class BridgeController:
         log.info("音频缓冲换代: gen=%d 原因=%s", generation, reason)
 
     # ------------------------------------------------------------- 意图下发
-    def _set_intent(self, mode: str, token: str, volume: Optional[int] = None) -> None:
+    def _set_intent(self, mode: str, token: str, volume: Optional[int] = None,
+                    set_uri: bool = True) -> None:
         with self._intent_lock:
             self._intent.revision += 1
             self._intent.mode = mode
+            self._intent.set_uri = set_uri
             if token:
                 self._intent.token = token
             if volume is not None:
@@ -573,6 +611,7 @@ class BridgeController:
                     token=self._intent.token,
                     volume=self._intent.volume,
                     revision=self._intent.revision,
+                    set_uri=self._intent.set_uri,
                 )
             retrying = self._converge_dirty and intent.revision == last_revision
             if intent.revision == last_revision and not self._converge_dirty:
@@ -615,9 +654,9 @@ class BridgeController:
             return
 
         if intent.mode == _MODE_PLAY:
-            self._do_play(record, client, intent.token)
+            self._do_play(record, client, intent.token, set_uri=intent.set_uri)
 
-    def _do_play(self, record, client, token: str) -> None:
+    def _do_play(self, record, client, token: str, set_uri: bool = True) -> None:
         session = self.streams.get(token)
         if session is None:
             log.warning("流会话不存在（可能已过期）: token=%s", token)
@@ -643,6 +682,20 @@ class BridgeController:
                     self._paused_with_stop = False
                 return
             log.warning("渲染器不接受续播，改为重建会话")
+
+        # 情况 2b：复用同一个 generation，但渲染器不在 PLAYING/PAUSED
+        #（例如它自己转成了 STOPPED）—— 只发 Play，**绝不重设 URI**：
+        # DLNA 语义下 SetAVTransportURI 会让渲染器从该资源**开头**重新播放，
+        # 真机现象就是「暂停后恢复变成从头播放」。
+        if already_this_token and not set_uri:
+            if self._safe_call(record, client.play, "Play"):
+                log.info("复用当前流：仅发送 Play（未重设 URI），渲染器从原处继续")
+                with self._lock:
+                    self.state.state = PLAYING
+                    self.state.renderer_state = _RENDERER_PLAYING
+                    self._paused_with_stop = False
+                return
+            log.warning("渲染器拒绝 Play，回退为重建会话（SetAVTransportURI）")
 
         # 情况 3：全新开始 / seek 后重建
         needed = int(self.config.get("preroll_seconds") * self.ring.byte_rate)
