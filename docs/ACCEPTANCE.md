@@ -5,7 +5,7 @@
 ## 准备
 
 ```bash
-appcenter-cli install-fpk Air2DLNA-1.0.2.fpk --volume 1
+appcenter-cli install-fpk Air2DLNA-1.0.0.fpk --volume 1
 appcenter-cli start air2dlna
 ```
 

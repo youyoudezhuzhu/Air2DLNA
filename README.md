@@ -1,8 +1,18 @@
-<img src="app/ui/images/icon_256.png" width="120" alt="Air2DLNA 图标">
+<p align="center"><img src="app/ui/images/icon_256.png" width="128" alt="Air2DLNA"></p>
 
-# Air2DLNA（飞牛 OS 原生 FPK 应用）
+<h1 align="center">Air2DLNA</h1>
 
-让**没有 AirPlay 2 的 DLNA/UPnP 音响**通过飞牛 NAS 获得 AirPlay 2 接收能力。
+<p align="center">把局域网里的 <b>DLNA / UPnP 音响</b>变成 <b>AirPlay 2 音箱</b> —— 飞牛 fnOS 原生应用，不需要 Docker。</p>
+
+AirPlay 2 是 Apple 设备独占的协议，而大量音响只支持 DLNA/UPnP。Air2DLNA 在飞牛 NAS 上内置一个**真正的 AirPlay 2 接收器**（shairport-sync + NQPTP），把 Apple 设备推来的音频实时解码成 PCM，再通过标准 UPnP AVTransport 控制 + 实时 HTTP 流交给局域网 DLNA 音响。iPhone / iPad / Mac 的 AirPlay 列表里会直接多出一个音箱，使用体验与原生 AirPlay 2 音箱一致。
+
+**核心特点**
+
+- **真正的 AirPlay 2 接收**：注册 `_airplay._tcp`（含 HomeKit 配对公钥）与兼容用 `_raop._tcp`，不是 AirPlay 1 兼容层
+- **实时桥接、不落盘**：PCM 经内存环形缓冲由渲染器边产生边拉取，全程不写磁盘
+- **自动发现 + 能力协商**：SSDP 发现局域网 DLNA 设备，先解析 `protocolInfo` 再推流，设备不支持时明确说明原因
+- **状态完整同步**：播放状态、标题/艺术家/专辑/封面、进度、音量；进程崩溃自动重启，渲染器掉线标记离线且不擅自切换设备
+- **原生 fpk 应用**：应用中心一键安装/升级/卸载，内置 Web UI 管理 AirPlay 名称、设备选择与日志
 
 ```text
 iPhone / iPad / Mac
@@ -21,16 +31,13 @@ iPhone / iPad / Mac
         DLNA / UPnP 音响
 ```
 
-安装后可直接在 Apple 设备的 AirPlay 列表里看到本应用，选择后音频会实时转发到
-你选定的 DLNA 音响——使用体验与原生 AirPlay 2 音箱一致。
-
 ---
 
 ## 1. 安装
 
 ```bash
 # 在飞牛 NAS 上（应用中心也可直接手动安装 .fpk）
-appcenter-cli install-fpk Air2DLNA-1.0.2.fpk --volume 1
+appcenter-cli install-fpk Air2DLNA-1.0.0.fpk --volume 1
 appcenter-cli start air2dlna
 ```
 
@@ -48,10 +55,10 @@ appcenter-cli start air2dlna
 
 之后日常使用完全不需要再打开 NAS。
 
-> 桌面入口说明（1.0.1 修复）：应用中心/桌面图标通过飞牛统一网关（`gatewaySocket` +
-> `gatewayPrefix`，见 `app/ui/config`）访问应用，服务端监听 `target/air2dlna.sock`
-> 并剥离 `/app/air2dlna` 前缀。此前使用 `{port}` / `{display_name}` 这类飞牛并不
-> 支持的占位符（飞牛只支持 `${...}` 形式），导致入口打开后是空白页。
+> 桌面入口实现：应用中心/桌面图标通过飞牛统一网关访问应用（`gatewaySocket` +
+> `gatewayPrefix`，见 `app/ui/config`），服务端监听 `target/air2dlna.sock` 并剥离
+> `/app/air2dlna` 前缀。注意飞牛 `ui/config` 只认 `${...}` 形式的占位符，
+> `{port}` / `{display_name}` 这类写法不会被替换（会导致入口打开后是空白页）。
 
 ---
 
@@ -101,7 +108,7 @@ airplay2-dlna-bridge/
 ```bash
 ./scripts/build.sh              # 全量构建（约 5–10 分钟）
 ./scripts/build.sh --skip-native  # 只重新打包
-# 产物：dist/Air2DLNA-1.0.2.fpk
+# 产物：dist/Air2DLNA-1.0.0.fpk
 ```
 
 脚本会：安装构建依赖 → 下载并**解包**（不安装）Avahi 开发文件 → 构建最小化静态

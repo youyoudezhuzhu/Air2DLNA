@@ -1,5 +1,5 @@
 appname                    = air2dlna
-version                    = 1.0.2
+version                    = 1.0.0
 display_name               = Air2DLNA
 desc                       = Air2DLNA：把任意 DLNA/UPnP 音响变成 AirPlay 2 音箱。应用原生运行在飞牛 NAS 上（不使用 Docker），内置 AirPlay 2 接收器，把 Apple 设备推来的音频实时转成 PCM 流经 HTTP 推送到局域网 DLNA MediaRenderer，并提供 Web UI 管理 AirPlay 名称、DLNA 设备选择、播放状态与日志。
 platform                   = x86
@@ -16,4 +16,4 @@ service_port               = 8788
 checkport                  = true
 ctl_stop                   = true
 disable_authorization_path = true
-changelog                  = 1.0.2 更名为 Air2DLNA，更换应用图标（桌面/应用中心/窗口标题/界面统一为新名称）。<br/>1.0.1 修复桌面/应用中心入口打开后为空白页：原配置使用了飞牛不支持的 {port}/{display_name} 占位符，现改用飞牛统一网关（gatewaySocket + gatewayPrefix）接入，并让服务端正确剥离网关路径前缀。<br/>1.0.0 首个版本：原生 AirPlay 2 接收（shairport-sync + NQPTP）、DLNA 自动发现、实时 PCM 桥接、播放状态同步、Web UI。
+changelog                  = 1.0.0 首个正式版：真正的 AirPlay 2 接收（shairport-sync + NQPTP）、DLNA 自动发现与能力协商、实时 PCM 桥接（不落盘）、播放状态/进度/音量同步、内置 Web UI；应用中心与桌面入口通过飞牛统一网关（gatewaySocket + gatewayPrefix）接入。
