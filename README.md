@@ -37,7 +37,7 @@ iPhone / iPad / Mac
 
 ```bash
 # 在飞牛 NAS 上（应用中心也可直接手动安装 .fpk）
-appcenter-cli install-fpk Air2DLNA-1.0.1.fpk --volume 1
+appcenter-cli install-fpk Air2DLNA-1.0.2.fpk --volume 1
 appcenter-cli start air2dlna
 ```
 
@@ -108,7 +108,7 @@ airplay2-dlna-bridge/
 ```bash
 ./scripts/build.sh              # 全量构建（约 5–10 分钟）
 ./scripts/build.sh --skip-native  # 只重新打包
-# 产物：dist/Air2DLNA-1.0.1.fpk
+# 产物：dist/Air2DLNA-1.0.2.fpk
 ```
 
 脚本会：安装构建依赖 → 下载并**解包**（不安装）Avahi 开发文件 → 构建最小化静态

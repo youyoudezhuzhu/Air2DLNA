@@ -94,6 +94,13 @@ class _Intent:
 class BridgeController:
     """把 AirPlay 事件、PCM 缓冲、DLNA 渲染器粘合在一起。"""
 
+    #: 会话建立后的漂移宽限期（秒）：渲染器此时仍在缓冲，位置值不可比
+    DRIFT_GRACE_SECONDS = 8.0
+    #: 两次漂移重建之间的最小间隔（秒），避免抖动造成反复切断播放
+    DRIFT_REBUILD_COOLDOWN_SECONDS = 10.0
+    #: 单个播放会话内允许的漂移重建次数上限，超过则停止自动重建
+    DRIFT_REBUILD_LIMIT = 5
+
     def __init__(self, config, registry, ring: PcmRingBuffer, timeline: AudioTimeline,
                  streams: stream.StreamManager, log=None) -> None:
         self.config = config
@@ -119,6 +126,12 @@ class BridgeController:
         self._paused_with_stop = False
         self._action_errors = 0
         self._pending_reanchor = False
+        #: 当前 DLNA 会话的建立时刻（用于漂移宽限期）
+        self._session_started_at = 0.0
+        #: 漂移重建的冷却与次数控制（防止反复重建把播放切成碎片）
+        self._last_drift_rebuild = 0.0
+        self._drift_rebuilds = 0
+        self._drift_limit_logged = False
         #: 上一轮收敛失败需要重试（由 _safe_call 置位）
         self._converge_dirty = False
         self._last_volume_tx = 0.0
@@ -263,6 +276,9 @@ class BridgeController:
                 token = self._gen_token
             if need_rebuild:
                 log.info("恢复播放：渲染器此前无法暂停，重建 DLNA 会话")
+                # 与 seek 一致：必须先换代 —— 否则新会话会从本代起点读到几十秒前的
+                # 旧数据，且漂移基准（代偏移）没有更新，会立刻再次触发重建。
+                self._begin_new_generation(reason="resume-rebuild", offset_ms=None)
                 self._start_dlna_session(reason="resume-rebuild")
             elif token:
                 log.info("恢复播放：向渲染器发送 Play")
@@ -273,6 +289,9 @@ class BridgeController:
 
         # pbeg：新的播放会话
         log.info("AirPlay session started")
+        self._drift_rebuilds = 0
+        self._drift_limit_logged = False
+        self._last_drift_rebuild = 0.0
         self._begin_new_generation(reason="pbeg", offset_ms=None)
         self._start_dlna_session(reason="pbeg")
 
@@ -310,6 +329,10 @@ class BridgeController:
             self._renderer_token = ""
             self._paused_with_stop = False
             self._pending_reanchor = False
+        self._drift_rebuilds = 0
+        self._drift_limit_logged = False
+        self._last_drift_rebuild = 0.0
+        self._session_started_at = 0.0
         self.streams.close_all()
         self._set_intent(_MODE_STOP, "")
 
@@ -538,6 +561,8 @@ class BridgeController:
             self._paused_with_stop = False
             self._renderer_token = session.token
         self.timeline.update_renderer_position(0.0)
+        # 记录会话建立时刻：渲染器此时还在缓冲、位置会滞后，宽限期内不做漂移判定
+        self._session_started_at = time.monotonic()
         self._ensure_subscriptions(record)
 
     def _do_pause(self, record, client) -> None:
@@ -688,13 +713,40 @@ class BridgeController:
         drift = self.timeline.drift_ms()
         if drift is None:
             return
+        # 会话刚建立时渲染器仍在缓冲，rel_time 尚未反映真实播放位置，
+        # 此时比较只会得到假漂移（并触发无意义的重建）。
+        if time.monotonic() - self._session_started_at < self.DRIFT_GRACE_SECONDS:
+            return
         threshold = float(self.config.get("drift_threshold_ms"))
-        if abs(drift) > threshold:
-            log.warning(
-                "检测到时间线漂移 %.0f ms（阈值 %.0f ms），重建 DLNA 会话以对齐: %s",
-                drift, threshold, record.name,
-            )
-            self._start_dlna_session(reason="drift")
+        if abs(drift) <= threshold:
+            return
+        if self._drift_rebuilds >= self.DRIFT_REBUILD_LIMIT:
+            if not self._drift_limit_logged:
+                self._drift_limit_logged = True
+                log.warning(
+                    "漂移反复出现（本会话已重建 %d 次，最近偏差 %.0f ms），"
+                    "停止自动重建以免把播放切成碎片：%s（可重新播放或切换设备恢复对齐）",
+                    self._drift_rebuilds, drift, record.name,
+                )
+            return
+        now = time.monotonic()
+        if now - self._last_drift_rebuild < self.DRIFT_REBUILD_COOLDOWN_SECONDS:
+            log.debug("漂移 %.0f ms 仍在重建冷却期内，本次跳过", drift)
+            return
+        self._drift_rebuilds += 1
+        self._last_drift_rebuild = now
+        log.warning(
+            "检测到时间线漂移 %.0f ms（阈值 %.0f ms），重建 DLNA 会话以对齐: %s（第 %d 次）",
+            drift, threshold, record.name, self._drift_rebuilds,
+        )
+        # **必须换代**：
+        # ① 不换代时渲染器从本代 offset=0 重新拉流，读到的是这一代里最早的数据
+        #    （可能已是几十秒前的音频）—— 听感就是同一小段被反复重播；
+        # ② 换代时 begin_generation() 会把「当前曲目位置」记为新基准偏移，
+        #    漂移检测才有正确的参照。否则漂移恒等于曲目绝对位置，每 2~3 秒
+        #    重建一次，形成死循环。
+        self._begin_new_generation(reason="drift", offset_ms=None)
+        self._start_dlna_session(reason="drift")
 
     def _sync_positions(self) -> None:
         position = self.timeline.position_ms()
