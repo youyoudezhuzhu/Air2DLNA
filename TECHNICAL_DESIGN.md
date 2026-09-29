@@ -1,7 +1,7 @@
 # TECHNICAL_DESIGN.md
 
-**项目**：AirPlay 2 → DLNA 音频桥接（飞牛 OS 原生 FPK 应用）
-**目标产物**：`AirPlay2-DLNA-Bridge-1.0.0.fpk`
+**项目**：Air2DLNA 音频桥接（飞牛 OS 原生 FPK 应用）
+**目标产物**：`Air2DLNA-1.0.2.fpk`
 **约束**：禁止 Docker / Podman / LXC / 容器套容器，必须原生进程运行在飞牛 OS 主机
 **文档状态**：编码前的技术评估（本文档为实现的规格来源）
 
@@ -462,7 +462,7 @@ GENA `LastChange` 推送是**事件驱动**的，可能密集。同步器对位�
    （同上游版本，ABI 一致），因此不需要随包分发 Avahi。
 4. 运行期依赖系统 `avahi-daemon` + D-Bus。飞牛 OS 默认运行二者（实测本机
    `avahi-daemon` 常驻），且调试确认 **应用用户** 具备通过 D-Bus 发布服务的权限
-   （以 `airplay2dlna` 用户执行 `avahi-publish` 成功并可被浏览到）。
+   （以 `air2dlna` 用户执行 `avahi-publish` 成功并可被浏览到）。
 5. 不把服务绑定到 loopback：mDNS 在 LAN 接口上组播（第 17 节）。
 
 > 构建脚本同时保留 `--with-tinysvcmdns` 分支作为**无 Avahi 环境的降级选项**，
@@ -532,7 +532,7 @@ airplay2-dlna-bridge/                # 源码仓库根
     │   └── images/icon_64.png, icon_256.png
     └── server/
         ├── bridge.py                # 主进程入口
-        ├── airplay2dlna/            # Python 包（仅标准库）
+        ├── air2dlna/            # Python 包（仅标准库）
         │   ├── config.py  logging_setup.py  netif.py
         │   ├── ringbuffer.py  timeline.py  metadata.py
         │   ├── ssdp.py  upnp.py  renderer.py
@@ -550,13 +550,13 @@ airplay2-dlna-bridge/                # 源码仓库根
 安装后（fnOS 规范）：
 
 ```text
-/var/apps/airplay2dlna/
+/var/apps/air2dlna/
 ├── manifest  cmd/  config/  wizard/  ICON*.PNG
-├── target  -> /vol{n}/@appcenter/airplay2dlna   （= TRIM_APPDEST）
-├── etc     -> /vol{n}/@appconf/airplay2dlna     （= TRIM_PKGETC，配置）
-├── var     -> /vol{n}/@appdata/airplay2dlna     （= TRIM_PKGVAR，运行数据/日志/FIFO）
-├── tmp     -> /vol{n}/@apptemp/airplay2dlna     （= TRIM_PKGTMP）
-└── home    -> /vol{n}/@apphome/airplay2dlna     （= TRIM_PKGHOME）
+├── target  -> /vol{n}/@appcenter/air2dlna   （= TRIM_APPDEST）
+├── etc     -> /vol{n}/@appconf/air2dlna     （= TRIM_PKGETC，配置）
+├── var     -> /vol{n}/@appdata/air2dlna     （= TRIM_PKGVAR，运行数据/日志/FIFO）
+├── tmp     -> /vol{n}/@apptemp/air2dlna     （= TRIM_PKGTMP）
+└── home    -> /vol{n}/@apphome/air2dlna     （= TRIM_PKGHOME）
 ```
 
 **不硬编码安装卷与路径**：全部通过 `TRIM_APPDEST` / `TRIM_PKGETC` / `TRIM_PKGVAR` /
@@ -684,7 +684,7 @@ Renderer unavailable (udn=uuid:...)
   - 只有 **nqptp**（45 KB、单一职责、只收发 PTP 报文、不监听 TCP、不解析外部输入）
     以 root 运行；
   - **shairport-sync** 与 **bridge.py** 由 `cmd/main` 通过 `setpriv`/`runuser`
-    **降权到应用用户** `airplay2dlna` 运行；降权失败时记录明确告警并按 root 继续
+    **降权到应用用户** `air2dlna` 运行；降权失败时记录明确告警并按 root 继续
     （保证可用性优先，且日志可审计）。
 - 不以 root 运行任何面向用户的 HTTP 服务（bridge.py 为应用用户）。
 

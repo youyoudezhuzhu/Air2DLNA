@@ -1,4 +1,6 @@
-# AirPlay 2 → DLNA 桥接（飞牛 OS 原生 FPK 应用）
+<img src="app/ui/images/icon_256.png" width="120" alt="Air2DLNA 图标">
+
+# Air2DLNA（飞牛 OS 原生 FPK 应用）
 
 让**没有 AirPlay 2 的 DLNA/UPnP 音响**通过飞牛 NAS 获得 AirPlay 2 接收能力。
 
@@ -28,8 +30,8 @@ iPhone / iPad / Mac
 
 ```bash
 # 在飞牛 NAS 上（应用中心也可直接手动安装 .fpk）
-appcenter-cli install-fpk AirPlay2-DLNA-Bridge-1.0.0.fpk --volume 1
-appcenter-cli start airplay2dlna
+appcenter-cli install-fpk Air2DLNA-1.0.2.fpk --volume 1
+appcenter-cli start air2dlna
 ```
 
 依赖：应用中心里的 **Python 3.12**（`python312`，已在 `manifest` 中声明为
@@ -47,8 +49,8 @@ appcenter-cli start airplay2dlna
 之后日常使用完全不需要再打开 NAS。
 
 > 桌面入口说明（1.0.1 修复）：应用中心/桌面图标通过飞牛统一网关（`gatewaySocket` +
-> `gatewayPrefix`，见 `app/ui/config`）访问应用，服务端监听 `target/airplay2dlna.sock`
-> 并剥离 `/app/airplay2dlna` 前缀。此前使用 `{port}` / `{display_name}` 这类飞牛并不
+> `gatewayPrefix`，见 `app/ui/config`）访问应用，服务端监听 `target/air2dlna.sock`
+> 并剥离 `/app/air2dlna` 前缀。此前使用 `{port}` / `{display_name}` 这类飞牛并不
 > 支持的占位符（飞牛只支持 `${...}` 形式），导致入口打开后是空白页。
 
 ---
@@ -85,7 +87,7 @@ airplay2-dlna-bridge/
 │       ├── bridge.py        # 主进程入口
 │       ├── config_cli.py    # 生命周期脚本用的配置工具
 │       ├── nqptp-watchdog.sh
-│       ├── airplay2dlna/    # Python 包（仅标准库）
+│       ├── air2dlna/    # Python 包（仅标准库）
 │       └── bin/  lib/       # 自编译二进制与随包库
 ├── scripts/build.sh         # 可复现构建
 ├── tests/                   # 单元测试 + 假渲染器端到端测试
@@ -99,7 +101,7 @@ airplay2-dlna-bridge/
 ```bash
 ./scripts/build.sh              # 全量构建（约 5–10 分钟）
 ./scripts/build.sh --skip-native  # 只重新打包
-# 产物：dist/AirPlay2-DLNA-Bridge-1.0.0.fpk
+# 产物：dist/Air2DLNA-1.0.2.fpk
 ```
 
 脚本会：安装构建依赖 → 下载并**解包**（不安装）Avahi 开发文件 → 构建最小化静态
@@ -135,19 +137,19 @@ Play → WAV 头与 PCM 内容校验 → 音量映射 → 暂停/恢复 → Seek
 
 | 内容 | 路径 |
 |---|---|
-| 配置 | `/vol1/@appconf/airplay2dlna/config.json` |
-| 主日志 | `/vol1/@appdata/airplay2dlna/bridge.log` |
-| 接收器日志 | `/vol1/@appdata/airplay2dlna/shairport-sync.log` |
-| 时钟守护进程日志 | `/vol1/@appdata/airplay2dlna/nqptp.log` |
-| PCM / 元数据 FIFO | `/vol1/@appdata/airplay2dlna/{audio,metadata}.fifo` |
+| 配置 | `/vol1/@appconf/air2dlna/config.json` |
+| 主日志 | `/vol1/@appdata/air2dlna/bridge.log` |
+| 接收器日志 | `/vol1/@appdata/air2dlna/shairport-sync.log` |
+| 时钟守护进程日志 | `/vol1/@appdata/air2dlna/nqptp.log` |
+| PCM / 元数据 FIFO | `/vol1/@appdata/air2dlna/{audio,metadata}.fifo` |
 
 升级**不会**删除配置；卸载时可在向导里选择保留或删除。
 
 ### 常用排查
 
 ```bash
-appcenter-cli status airplay2dlna          # 运行状态
-tail -f /vol1/@appdata/airplay2dlna/bridge.log
+appcenter-cli status air2dlna          # 运行状态
+tail -f /vol1/@appdata/air2dlna/bridge.log
 avahi-browse -rt _airplay._tcp             # 应能看到你的 AirPlay 名称与 features=...
 ss -lunp | grep -E ':319|:320'             # NQPTP 的 PTP 端口
 ```

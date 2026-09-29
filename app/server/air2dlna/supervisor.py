@@ -50,7 +50,7 @@ def render_shairport_config(airplay_name: str, rtsp_port: int, audio_fifo: str,
     name = escape_config_string(airplay_name)
     audio = escape_config_string(audio_fifo)
     metadata = escape_config_string(metadata_fifo)
-    return f"""// 由 AirPlay2-DLNA-Bridge 自动生成，请勿手工修改（修改会在下次启动时被覆盖）
+    return f"""// 由 Air2DLNA 自动生成，请勿手工修改（修改会在下次启动时被覆盖）
 general =
 {{
     name = "{name}";

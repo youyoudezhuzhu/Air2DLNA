@@ -41,7 +41,7 @@ SOAP_ENVELOPE_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 #: SOAP 编码风格命名空间。
 SOAP_ENCODING_NS = "http://schemas.xmlsoap.org/soap/encoding/"
 #: 请求 User-Agent（部分设备按此做过滤）。
-USER_AGENT = "airplay2dlna/0.1 UPnP/1.0"
+USER_AGENT = "air2dlna/0.1 UPnP/1.0"
 
 #: 日志回调类型别名：接收单条字符串消息，可为 None。
 LogFunc = Callable[[str], None] | None

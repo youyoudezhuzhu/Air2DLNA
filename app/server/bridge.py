@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""AirPlay 2 → DLNA 桥接主进程。
+"""Air2DLNA主进程。
 
 用法（由 ``cmd/main`` 调用，也可独立运行便于开发调试）::
 
@@ -35,17 +35,17 @@ from typing import Optional
 # 允许以脚本方式直接运行（开发调试）
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from airplay2dlna import logging_setup, netif, renderer, ssdp, state, stream, supervisor, upnp, webui  # noqa: E402
-from airplay2dlna.config import Config  # noqa: E402
-from airplay2dlna.metadata import MetadataPipeReader  # noqa: E402
-from airplay2dlna.ringbuffer import PcmRingBuffer  # noqa: E402
-from airplay2dlna.timeline import AudioTimeline  # noqa: E402
+from air2dlna import logging_setup, netif, renderer, ssdp, state, stream, supervisor, upnp, webui  # noqa: E402
+from air2dlna.config import Config  # noqa: E402
+from air2dlna.metadata import MetadataPipeReader  # noqa: E402
+from air2dlna.ringbuffer import PcmRingBuffer  # noqa: E402
+from air2dlna.timeline import AudioTimeline  # noqa: E402
 
 log = logging.getLogger("bridge")
 
 DEFAULT_VERSION = "1.0.0"
 # 飞牛统一网关为应用分配的路径前缀（与 app/ui/config 的 gatewayPrefix 保持一致）
-DEFAULT_GATEWAY_PREFIX = "/app/airplay2dlna"
+DEFAULT_GATEWAY_PREFIX = "/app/air2dlna"
 
 
 class AudioPipeReader(threading.Thread):
@@ -180,7 +180,7 @@ class Bridge:
         logging_setup.setup_logging(self.log_path, self.config.get("log_level"))
         logging_setup.set_level(self.config.get("log_level"))
         log.info("=" * 72)
-        log.info("AirPlay 2 → DLNA 桥接 启动中 (version=%s)", self.version)
+        log.info("Air2DLNA 启动中 (version=%s)", self.version)
         log.info("配置目录=%s 运行目录=%s", self.config_dir, self.var_dir)
         log.info("网络接口候选=%s", netif.select_lan_addresses())
 
@@ -342,7 +342,7 @@ class Bridge:
         if self.manage_shairport:
             self._shairport.start_watchdog()
 
-        log.info("AirPlay 2 → DLNA 桥接已就绪")
+        log.info("Air2DLNA已就绪")
 
         # 主循环等待退出信号
         while not self._stop_event.wait(0.5):
@@ -350,7 +350,7 @@ class Bridge:
         return 0
 
     def shutdown(self) -> None:
-        log.info("正在停止 AirPlay 2 → DLNA 桥接 ...")
+        log.info("正在停止 Air2DLNA ...")
         self._stop_event.set()
         for component in (
             self._web.stop if self._web else None,
@@ -379,9 +379,9 @@ def _env(name: str, default: str) -> str:
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     appdest = _env("TRIM_APPDEST", os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
-    parser = argparse.ArgumentParser(description="AirPlay 2 → DLNA 桥接服务")
-    parser.add_argument("--config-dir", default=_env("TRIM_PKGETC", "/tmp/airplay2dlna/etc"))
-    parser.add_argument("--var-dir", default=_env("TRIM_PKGVAR", "/tmp/airplay2dlna/var"))
+    parser = argparse.ArgumentParser(description="Air2DLNA服务")
+    parser.add_argument("--config-dir", default=_env("TRIM_PKGETC", "/tmp/air2dlna/etc"))
+    parser.add_argument("--var-dir", default=_env("TRIM_PKGVAR", "/tmp/air2dlna/var"))
     parser.add_argument("--ui-dir", default=os.path.join(appdest, "ui"))
     parser.add_argument("--bin-dir", default=os.path.join(appdest, "server", "bin"))
     parser.add_argument("--version", default=_env("TRIM_APPVER", DEFAULT_VERSION))
@@ -391,7 +391,7 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--gateway-prefix", default=_env("GATEWAY_PREFIX", DEFAULT_GATEWAY_PREFIX),
-        help="飞牛统一网关路径前缀，例如 /app/airplay2dlna",
+        help="飞牛统一网关路径前缀，例如 /app/air2dlna",
     )
     parser.add_argument(
         "--no-shairport", action="store_true",

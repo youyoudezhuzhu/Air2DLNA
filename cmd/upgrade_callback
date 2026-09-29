@@ -1,10 +1,10 @@
 #!/bin/bash
 # 升级后：幂等迁移配置（只增不删），并按需重启
 set -u
-APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
-ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
-VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
-RUN_USER="${TRIM_USERNAME:-airplay2dlna}"
+APP="${TRIM_APPDEST:-/var/apps/air2dlna/target}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/air2dlna}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/air2dlna}"
+RUN_USER="${TRIM_USERNAME:-air2dlna}"
 PYTHON="/var/apps/python312/target/bin/python3"
 LOGF="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
 
@@ -20,7 +20,7 @@ if id -u "$RUN_USER" >/dev/null 2>&1; then
     # 升级会重新解包应用目录，套接字的写权限可能被覆盖掉，这里补回来
     chgrp "$RUN_USER" "$APP" 2>/dev/null || true
     chmod 775 "$APP" 2>/dev/null || true
-    rm -f "$APP/airplay2dlna.sock" 2>/dev/null || true
+    rm -f "$APP/air2dlna.sock" 2>/dev/null || true
 fi
 "$APP/cmd/main" start >/dev/null 2>&1 || true
 exit 0

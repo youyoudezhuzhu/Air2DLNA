@@ -17,7 +17,7 @@ REPO=""
 VISIBILITY="public"
 TOKEN_FILE=""
 TAG="v$(sed -n 's/^version[[:space:]]*=[[:space:]]*//p' "$ROOT/manifest" | tr -d '[:space:]')"
-FPK="$ROOT/dist/AirPlay2-DLNA-Bridge-${TAG#v}.fpk"
+FPK="$ROOT/dist/Air2DLNA-${TAG#v}.fpk"
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -75,7 +75,7 @@ else
     api POST /user/repos "$(python3 -c "
 import json,sys
 print(json.dumps({'name': sys.argv[1], 'private': sys.argv[2]=='private',
-                  'description': '飞牛 OS 原生 AirPlay 2 → DLNA 桥接应用（无 Docker）',
+                  'description': '飞牛 OS 原生 Air2DLNA应用（无 Docker）',
                   'has_issues': True, 'has_wiki': False}))" "$NAME" "$VISIBILITY")" >/dev/null
     echo "    已创建仓库"
 fi
@@ -115,13 +115,13 @@ if [ -f "$FPK" ]; then
 
     BODY_FILE="$(mktemp)"
     cat > "$BODY_FILE" <<BODY_EOF
-飞牛 OS 原生 AirPlay 2 → DLNA 桥接应用（不使用 Docker）。
+飞牛 OS 原生 Air2DLNA应用（不使用 Docker）。
 
 ## 安装
 1. 应用中心 →「手动安装」→ 选择本页的 \`.fpk\`；或
 2. \`\`\`bash
    appcenter-cli install-fpk $ASSET --volume 1
-   appcenter-cli start airplay2dlna
+   appcenter-cli start air2dlna
    \`\`\`
 
 依赖：应用中心的 **Python 3.12**（\`python312\`，安装时自动准备）。

@@ -1,11 +1,11 @@
 #!/bin/bash
 # 安装后：准备目录权限、写初始配置、确保可执行位
 set -u
-APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
-VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
-ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
-HOME_DIR="${TRIM_PKGHOME:-/vol1/@apphome/airplay2dlna}"
-RUN_USER="${TRIM_USERNAME:-airplay2dlna}"
+APP="${TRIM_APPDEST:-/var/apps/air2dlna/target}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/air2dlna}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/air2dlna}"
+HOME_DIR="${TRIM_PKGHOME:-/vol1/@apphome/air2dlna}"
+RUN_USER="${TRIM_USERNAME:-air2dlna}"
 PYTHON="/var/apps/python312/target/bin/python3"
 LOGF="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
 
@@ -28,10 +28,10 @@ fi
 if id -u "$RUN_USER" >/dev/null 2>&1; then
     chown -R "$RUN_USER" "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
     chmod 750 "$VAR" "$ETC" "$HOME_DIR" 2>/dev/null
-    # 飞牛统一网关套接字位于应用目录内（airplay2dlna.sock），桌面入口能否打开
+    # 飞牛统一网关套接字位于应用目录内（air2dlna.sock），桌面入口能否打开
     # 取决于降权后的应用用户能否在此创建套接字 —— 给组写权限并清掉残留套接字。
     chgrp "$RUN_USER" "$APP" 2>/dev/null || true
     chmod 775 "$APP" 2>/dev/null || true
-    rm -f "$APP/airplay2dlna.sock" 2>/dev/null || true
+    rm -f "$APP/air2dlna.sock" 2>/dev/null || true
 fi
 exit 0

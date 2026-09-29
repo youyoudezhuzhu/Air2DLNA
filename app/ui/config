@@ -1,13 +1,13 @@
 {
     ".url": {
-        "airplay2dlna.main": {
-            "title": "AirPlay 2 → DLNA 桥接",
+        "air2dlna.main": {
+            "title": "Air2DLNA",
             "icon": "images/icon_{0}.png",
             "type": "iframe",
             "protocol": "",
-            "gatewayPrefix": "/app/airplay2dlna",
-            "gatewaySocket": "airplay2dlna.sock",
-            "url": "/app/airplay2dlna",
+            "gatewayPrefix": "/app/air2dlna",
+            "gatewaySocket": "air2dlna.sock",
+            "url": "/app/air2dlna",
             "allUsers": true
         }
     }

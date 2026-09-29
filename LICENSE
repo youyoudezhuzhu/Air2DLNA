@@ -1,6 +1,6 @@
 MIT License
 
-Copyright (c) 2026 AirPlay2-DLNA-Bridge contributors
+Copyright (c) 2026 Air2DLNA contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -22,7 +22,7 @@ SOFTWARE.
 
 -------------------------------------------------------------------------------
 NOTE: This license applies to the original code in this repository
-(the `airplay2dlna` Python package, `bridge.py`, the Web UI, lifecycle scripts,
+(the `air2dlna` Python package, `bridge.py`, the Web UI, lifecycle scripts,
 build scripts and documentation).
 
 The packaged `.fpk` ALSO CONTAINS third-party programs that are distributed

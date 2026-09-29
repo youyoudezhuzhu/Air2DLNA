@@ -47,7 +47,7 @@ class AppContext:
         self.version = version
         self.ui_dir = ui_dir
         self.started_at = started_at
-        # 飞牛统一网关前缀（如 /app/airplay2dlna）。网关把完整路径原样转给
+        # 飞牛统一网关前缀（如 /app/air2dlna）。网关把完整路径原样转给
         # 应用，所以这里保存下来，请求进来时先剥掉，再按内部路由表匹配。
         self.gateway_prefix = (gateway_prefix or "").rstrip("/")
         self.discovering = threading.Event()
@@ -57,7 +57,7 @@ class AppContext:
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "AirPlay2DLNA/1.0"
+    server_version = "Air2DLNA/1.0"
     sys_version = ""
     protocol_version = "HTTP/1.1"
 

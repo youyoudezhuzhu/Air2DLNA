@@ -24,10 +24,10 @@ SERVER_DIR = REPO_ROOT / "app" / "server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from airplay2dlna import webui  # noqa: E402
+from air2dlna import webui  # noqa: E402
 
-PREFIX = "/app/airplay2dlna"
-INDEX_HTML = "<!DOCTYPE html><html><body>airplay2dlna ui</body></html>"
+PREFIX = "/app/air2dlna"
+INDEX_HTML = "<!DOCTYPE html><html><body>air2dlna ui</body></html>"
 
 
 class _FakeContext:
@@ -82,7 +82,7 @@ class GatewaySocketTests(unittest.TestCase):
         (cls.ui_dir / "index.html").write_text(INDEX_HTML, encoding="utf-8")
         (cls.ui_dir / "css" / "app.css").write_text("body{}", encoding="utf-8")
         (cls.ui_dir / "js" / "app.js").write_text("/* ui */", encoding="utf-8")
-        cls.sock_path = str(root / "airplay2dlna.sock")
+        cls.sock_path = str(root / "air2dlna.sock")
 
         cls.ctx = _FakeContext(str(cls.ui_dir), PREFIX)
         cls.server = webui.UnixHTTPServer(cls.sock_path, webui.Handler)  # type: ignore[arg-type]
@@ -107,7 +107,7 @@ class GatewaySocketTests(unittest.TestCase):
 
     # -------------------------------------------------------------- 前缀路由
     def test_bare_prefix_redirects_to_trailing_slash(self) -> None:
-        """ui/config 里的 url 是 /app/airplay2dlna（无结尾斜杠），必须补斜杠。"""
+        """ui/config 里的 url 是 /app/air2dlna（无结尾斜杠），必须补斜杠。"""
         response = _raw_request(self.sock_path, "GET", PREFIX)
         self.assertIn("307", response.splitlines()[0])
         self.assertIn(f"Location: {PREFIX}/", response)
@@ -116,7 +116,7 @@ class GatewaySocketTests(unittest.TestCase):
         response = _raw_request(self.sock_path, "GET", PREFIX + "/")
         self.assertIn("200", response.splitlines()[0])
         self.assertIn("text/html", response)
-        self.assertIn("airplay2dlna ui", response)
+        self.assertIn("air2dlna ui", response)
 
     def test_static_assets_served_under_prefix(self) -> None:
         """相对路径资源（css/js/images）必须能在前缀下取到，否则就是空白页。"""
@@ -139,7 +139,7 @@ class GatewaySocketTests(unittest.TestCase):
         """直接访问 TCP 端口（如 http://<NAS>:8788/）也必须正常。"""
         response = _raw_request(self.sock_path, "GET", "/")
         self.assertIn("200", response.splitlines()[0])
-        self.assertIn("airplay2dlna ui", response)
+        self.assertIn("air2dlna ui", response)
 
     def test_api_without_prefix_still_served(self) -> None:
         response = _raw_request(self.sock_path, "GET", "/api/health")
@@ -148,8 +148,8 @@ class GatewaySocketTests(unittest.TestCase):
 
 class PrefixNormalisationTests(unittest.TestCase):
     def test_trailing_slash_is_stripped(self) -> None:
-        ctx = _FakeContext("/tmp", "/app/airplay2dlna/")
-        self.assertEqual("/app/airplay2dlna", ctx.gateway_prefix)
+        ctx = _FakeContext("/tmp", "/app/air2dlna/")
+        self.assertEqual("/app/air2dlna", ctx.gateway_prefix)
 
     def test_empty_prefix_disables_rewrite(self) -> None:
         ctx = _FakeContext("/tmp", "")

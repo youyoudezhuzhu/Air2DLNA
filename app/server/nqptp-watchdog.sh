@@ -8,8 +8,8 @@
 # 本脚本由 cmd/main 以 nohup 方式启动，负责「启动 + 保持存活 + 退出清理」。
 set -u
 
-VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
-BIN="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}/server/bin/nqptp"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/air2dlna}"
+BIN="${TRIM_APPDEST:-/var/apps/air2dlna/target}/server/bin/nqptp"
 PID_FILE="$VAR/nqptp.pid"
 LOG="$VAR/nqptp.log"
 MAIN_LOG="$VAR/main.log"

@@ -5,8 +5,8 @@
 ## 准备
 
 ```bash
-appcenter-cli install-fpk AirPlay2-DLNA-Bridge-1.0.0.fpk --volume 1
-appcenter-cli start airplay2dlna
+appcenter-cli install-fpk Air2DLNA-1.0.2.fpk --volume 1
+appcenter-cli start air2dlna
 ```
 
 在 Web UI（`http://<NAS_IP>:8788`）里：
@@ -46,7 +46,7 @@ curl -s http://127.0.0.1:8788/api/health          # -> {"ok": true}
 curl -s http://127.0.0.1:8788/api/status | head -c 400
 
 # 5) 日志无异常
-grep -cE "Traceback" /vol1/@appdata/airplay2dlna/bridge.log   # -> 0
+grep -cE "Traceback" /vol1/@appdata/air2dlna/bridge.log   # -> 0
 ```
 
 ---
@@ -137,10 +137,10 @@ grep -cE "Traceback" /vol1/@appdata/airplay2dlna/bridge.log   # -> 0
 
 ```bash
 # 内存是否持续增长（应大致平稳）
-while :; do ps -o rss= -p "$(cat /vol1/@appdata/airplay2dlna/app.pid)"; sleep 60; done
+while :; do ps -o rss= -p "$(cat /vol1/@appdata/air2dlna/app.pid)"; sleep 60; done
 
 # CPU 是否异常（正常应在个位数百分比）
-top -b -n1 -p "$(cat /vol1/@appdata/airplay2dlna/app.pid)" | tail -2
+top -b -n1 -p "$(cat /vol1/@appdata/air2dlna/app.pid)" | tail -2
 
 # 漂移：比较 Web UI 位置与 iPhone 显示位置的差值是否持续变大
 curl -s http://127.0.0.1:8788/api/status | python3 -c "import json,sys;d=json.load(sys.stdin)['playback'];print(d['state'], d['position_ms'], d['duration_ms'])"
@@ -183,7 +183,7 @@ curl -s http://127.0.0.1:8788/api/status | python3 -c "import json,sys;d=json.lo
 - **端口占用**：先让另一个 AirPlay 应用（micast / juneix.airplay2）占用 7000，
   再启动本应用。**期望**：启动失败并给出可读原因（写 `TRIM_TEMP_LOGFILE`），
   而不是静默运行一个不可用的服务。
-- **重复 start**：连续执行两次 `appcenter-cli start airplay2dlna`。
+- **重复 start**：连续执行两次 `appcenter-cli start air2dlna`。
   **期望**：不会产生第二个实例。
 - **升级保留配置**：改过 AirPlay 名称后升级到新版本。
   **期望**：名称与 DLNA 选择保留。

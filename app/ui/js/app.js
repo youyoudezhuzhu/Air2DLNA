@@ -1,5 +1,5 @@
 /*
- * AirPlay 2 → DLNA 桥接 —— Web UI 前端脚本
+ * Air2DLNA —— Web UI 前端脚本
  * ---------------------------------------------------------------------------
  * 纯原生 JavaScript：无框架 / 无构建步骤 / 无外部 CDN 依赖。
  *
@@ -167,7 +167,7 @@
   function warn() {
     try {
       if (window.console && typeof window.console.warn === 'function') {
-        window.console.warn.apply(window.console, ['[airplay2dlna]'].concat(Array.prototype.slice.call(arguments)));
+        window.console.warn.apply(window.console, ['[air2dlna]'].concat(Array.prototype.slice.call(arguments)));
       }
     } catch (e) { /* 忽略 */ }
   }

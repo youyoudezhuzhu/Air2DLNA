@@ -4,7 +4,7 @@
         "items": [
             {
                 "type": "tips",
-                "helpText": "您即将卸载 AirPlay 2 → DLNA 桥接。请选择如何处理应用配置与日志："
+                "helpText": "您即将卸载 Air2DLNA。请选择如何处理应用配置与日志："
             },
             {
                 "type": "radio",

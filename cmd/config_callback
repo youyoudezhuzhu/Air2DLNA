@@ -1,8 +1,8 @@
 #!/bin/bash
 # 应用设置变更后：写入新配置并重启
 set -u
-APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
-ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
+APP="${TRIM_APPDEST:-/var/apps/air2dlna/target}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/air2dlna}"
 PYTHON="/var/apps/python312/target/bin/python3"
 LOGF="${TRIM_TEMP_LOGFILE:-/dev/stderr}"
 

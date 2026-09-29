@@ -1,4 +1,4 @@
-"""AirPlay 2 -> DLNA 桥接器的 Python 包（仅使用标准库）。
+"""Air2DLNA 后端的 Python 包（仅使用标准库）。
 
 本包汇集桥接器后端的全部 Python 模块：网络接口探测、SSDP 发现、
 UPnP 设备描述与控制、音频缓冲/时间轴、元数据解析、HTTP 音频流服务、

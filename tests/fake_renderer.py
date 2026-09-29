@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""模拟一个 UPnP AV MediaRenderer，用于端到端验证 AirPlay 2 → DLNA 桥接。
+"""模拟一个 UPnP AV MediaRenderer，用于端到端验证 Air2DLNA。
 
 它实现了真实渲染器的三件事：
 

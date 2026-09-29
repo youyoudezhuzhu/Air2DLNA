@@ -19,7 +19,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from airplay2dlna.config import Config, ConfigError, migrate  # noqa: E402
+from air2dlna.config import Config, ConfigError, migrate  # noqa: E402
 
 
 def _load_raw(path: str) -> dict:
@@ -34,7 +34,7 @@ def _load_raw(path: str) -> dict:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="AirPlay2-DLNA-Bridge 配置工具")
+    parser = argparse.ArgumentParser(description="Air2DLNA 配置工具")
     parser.add_argument("--config-dir", required=True, help="配置目录（TRIM_PKGETC）")
     parser.add_argument("action", choices=("init", "set", "migrate"))
     parser.add_argument("assignments", nargs="*", help="k=v 形式")

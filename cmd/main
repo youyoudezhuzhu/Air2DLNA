@@ -1,5 +1,5 @@
 #!/bin/bash
-# AirPlay 2 → DLNA 桥接 —— 飞牛应用生命周期脚本
+# Air2DLNA —— 飞牛应用生命周期脚本
 #
 #   main start | stop | status
 #
@@ -16,12 +16,12 @@
 
 set -u
 
-APP="${TRIM_APPDEST:-/var/apps/airplay2dlna/target}"
-VAR="${TRIM_PKGVAR:-/vol1/@appdata/airplay2dlna}"
-ETC="${TRIM_PKGETC:-/vol1/@appconf/airplay2dlna}"
-HOME_DIR="${TRIM_PKGHOME:-/vol1/@apphome/airplay2dlna}"
+APP="${TRIM_APPDEST:-/var/apps/air2dlna/target}"
+VAR="${TRIM_PKGVAR:-/vol1/@appdata/air2dlna}"
+ETC="${TRIM_PKGETC:-/vol1/@appconf/air2dlna}"
+HOME_DIR="${TRIM_PKGHOME:-/vol1/@apphome/air2dlna}"
 PORT="${TRIM_SERVICE_PORT:-8788}"
-RUN_USER="${TRIM_USERNAME:-airplay2dlna}"
+RUN_USER="${TRIM_USERNAME:-air2dlna}"
 APPVER="${TRIM_APPVER:-1.0.0}"
 
 MAIN_LOG="$VAR/main.log"
@@ -37,8 +37,8 @@ BIN_DIR="$APP/server/bin"
 WATCHDOG="$APP/server/nqptp-watchdog.sh"
 
 # 飞牛统一网关：桌面/应用中心入口通过该 Unix 套接字 + 路径前缀访问 Web UI
-GATEWAY_SOCKET="${GATEWAY_SOCKET:-$APP/airplay2dlna.sock}"
-GATEWAY_PREFIX="${GATEWAY_PREFIX:-/app/airplay2dlna}"
+GATEWAY_SOCKET="${GATEWAY_SOCKET:-$APP/air2dlna.sock}"
+GATEWAY_PREFIX="${GATEWAY_PREFIX:-/app/air2dlna}"
 export GATEWAY_SOCKET GATEWAY_PREFIX
 
 # python312 是 manifest 中声明的依赖运行时
@@ -250,7 +250,7 @@ do_start() {
         log_msg "服务已在运行，跳过启动"
         return 0
     fi
-    log_msg "开始启动 AirPlay 2 → DLNA 桥接"
+    log_msg "开始启动 Air2DLNA"
     start_nqptp_watchdog
     start_bridge
     if ! health_check; then
@@ -264,7 +264,7 @@ do_start() {
 }
 
 do_stop() {
-    log_msg "开始停止 AirPlay 2 → DLNA 桥接"
+    log_msg "开始停止 Air2DLNA"
     stop_bridge
     stop_nqptp_watchdog
     log_msg "停止完成"

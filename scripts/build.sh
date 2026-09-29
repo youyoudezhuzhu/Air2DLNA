@@ -1,5 +1,5 @@
 #!/bin/bash
-# AirPlay2-DLNA-Bridge —— 可复现构建脚本
+# Air2DLNA —— 可复现构建脚本
 #
 # 从源码构建全部原生组件并打包出 .fpk。**不使用 Docker**。
 #
@@ -8,7 +8,7 @@
 #   ./scripts/build.sh --skip-native  # 只重新打包（组件已就位）
 #   ./scripts/build.sh --no-pack      # 只构建原生组件（CI 用，无需 fnpack）
 #
-# 产物：dist/AirPlay2-DLNA-Bridge-<version>.fpk
+# 产物：dist/Air2DLNA-<version>.fpk
 #
 # 构建依赖（脚本会自动安装）：
 #   build-essential autoconf automake libtool pkg-config git xxd plistutil
@@ -259,14 +259,14 @@ pack() {
     command -v fnpack >/dev/null || die "未找到 fnpack（飞牛官方打包工具）"
     ( cd "$WORK" && rm -f ./*.fpk && fnpack build --directory "$ROOT" >/dev/null )
 
-    local out="$DIST/AirPlay2-DLNA-Bridge-$VERSION.fpk"
+    local out="$DIST/Air2DLNA-$VERSION.fpk"
     mkdir -p "$DIST"
-    mv "$WORK/airplay2dlna.fpk" "$out"
+    mv "$WORK/air2dlna.fpk" "$out"
     log "打包完成：$out ($(du -h "$out" | cut -f1))"
     echo "$out"
 }
 
-log "AirPlay2-DLNA-Bridge 构建 (version=$VERSION)"
+log "Air2DLNA 构建 (version=$VERSION)"
 if [ "$SKIP_NATIVE" -eq 0 ]; then
     install_deps
     prepare_avahi_dev

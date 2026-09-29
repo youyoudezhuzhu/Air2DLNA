@@ -13,13 +13,13 @@ import unittest
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
-# 基于 __file__ 稳健地把 app/server 加入 sys.path，使 `airplay2dlna` 可导入。
+# 基于 __file__ 稳健地把 app/server 加入 sys.path，使 `air2dlna` 可导入。
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SERVER_DIR = REPO_ROOT / "app" / "server"
 if str(SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(SERVER_DIR))
 
-from airplay2dlna import upnp  # noqa: E402
+from air2dlna import upnp  # noqa: E402
 
 SOAP_ENV_NS = "http://schemas.xmlsoap.org/soap/envelope/"
 
