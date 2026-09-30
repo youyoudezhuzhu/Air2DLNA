@@ -424,21 +424,41 @@ class DLNAOutput:
         plan = self.buffer_plan(record)
         needed = int(plan["target_seconds"] * self.ring.byte_rate)
         generation = session.generation
-        try:
-            ready = self.ring.wait_for_data(0, generation, needed, timeout=8.0)
-        except StaleGeneration:
-            # 预滚动等待期间缓冲又换代了（seek 会连续产生多代）。**绝不能让它抛出
-            # converge**：那会中断整轮收敛，SetAVTransportURI/Play 都发不出去，
-            # 渲染器拿不到新 URI —— 真机表现就是「拖进度条后完全没有声音」。
-            # 正确做法是把意图重新指向最新一代，让收敛线程再跑一轮。
-            newest = getattr(self.streams, "current", None)
-            log.warning(
-                "预滚动期间缓冲换代（gen=%s → %s）：改用最新一代重新收敛，"
-                "避免中断 SetURI/Play",
-                generation, getattr(newest, "generation", "?"))
-            if newest is not None and newest.token != token:
-                self.set_intent(MODE_PLAY, newest.token, set_uri=True, play=True)
-            return
+        # **连续输出下绝不阻塞等待真实 PCM。**
+        # 真机实测（1.0.25）：换代 → SetAVTransportURI 的延迟在非 seek 重建时是 1~2 秒，
+        # 而在两次 seek 上都是**整整 8.0 秒**（预滚动超时）。原因就是这里在等 2 秒预滚动
+        # 数据，而 seek 之后 iPhone 要 10~20 秒才重新送出音频，于是这段等待被原封不动地
+        # 加在 SetAVTransportURI **之前** —— 等待期间渲染器处于 STOPPED，用户完全无声。
+        # 输出层本来就会用静音填充空窗（ARCHITECTURE_V2 第 6/7 节），所以这里应当
+        # **立即宣告**：让渲染器尽早开始拉流，PCM 一到就无缝接上。
+        if getattr(session, "continuous_output", False):
+            try:
+                available = self.ring.write_offset
+            except Exception:  # noqa: BLE001
+                available = 0
+            if available < needed:
+                log.info(
+                    "连续输出：立即宣告 URI，不等待预滚动"
+                    "（当前 %.1fs < 目标 %.1fs）——空窗交由输出层静音填充，"
+                    "避免把 seek 后的重缓冲时间加到 SetAVTransportURI 之前",
+                    available / float(self.ring.byte_rate or 1), plan["target_seconds"])
+            ready = True
+        else:
+            try:
+                ready = self.ring.wait_for_data(0, generation, needed, timeout=8.0)
+            except StaleGeneration:
+                # 预滚动等待期间缓冲又换代了（seek 会连续产生多代）。**绝不能让它抛出
+                # converge**：那会中断整轮收敛，SetAVTransportURI/Play 都发不出去，
+                # 渲染器拿不到新 URI —— 真机表现就是「拖进度条后完全没有声音」。
+                # 正确做法是把意图重新指向最新一代，让收敛线程再跑一轮。
+                newest = getattr(self.streams, "current", None)
+                log.warning(
+                    "预滚动期间缓冲换代（gen=%s → %s）：改用最新一代重新收敛，"
+                    "避免中断 SetURI/Play",
+                    generation, getattr(newest, "generation", "?"))
+                if newest is not None and newest.token != token:
+                    self.set_intent(MODE_PLAY, newest.token, set_uri=True, play=True)
+                return
         if not ready:
             try:
                 available = self.ring.write_offset

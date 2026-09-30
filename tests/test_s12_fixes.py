@@ -170,10 +170,12 @@ class PrerollStaleGenerationTests(unittest.TestCase):
             calls["n"] += 1
             raise StaleGeneration("等待预滚动期间缓冲换代（测试模拟真实 seek 的连续换代）")
 
+        # 预滚动等待只存在于**非连续输出**路径；显式关闭以覆盖该分支
+        session.continuous_output = False
         ring.wait_for_data = raiser
         try:
             # 旧实现在这里会把 StaleGeneration 抛出 converge —— 那就是真机上
-            # 「ERROR DLNA 收敛过程异常」以及「拖进度条后无声」的直接原因。
+            # 「ERROR [dlna_output] DLNA 收敛过程异常」的直接原因。
             controller.output.do_play(record, record.client, token,
                                       set_uri=True, play=True)
         except StaleGeneration:  # pragma: no cover
@@ -181,7 +183,39 @@ class PrerollStaleGenerationTests(unittest.TestCase):
         finally:
             ring.wait_for_data = original
 
-        self.assertEqual(calls["n"], 1, "应只尝试一次预滚动等待")
+        self.assertEqual(calls["n"], 1, "非连续输出路径应只尝试一次预滚动等待")
+
+    def test_continuous_output_does_not_block_on_preroll(self):
+        """连续输出下必须**立即宣告 URI**，绝不等待预滚动。
+
+        真机实测（1.0.25）：换代 → SetAVTransportURI 的延迟在非 seek 重建时为 1~2 秒，
+        而两次 seek 都是**整整 8.0 秒**（预滚动超时）——因为 seek 之后 iPhone 要 10~20 秒
+        才重新送出音频，等待把这段时间原封不动加在了 SetAVTransportURI **之前**，
+        期间渲染器 STOPPED、用户完全无声。输出层本来就会用静音填充空窗，
+        所以连续输出下必须跳过等待。
+        """
+        controller, config, ring, _timeline, record, streams = build_controller(model="S12")
+        controller._handle_play(False)
+        token = controller._gen_token
+        session = streams.get(token)
+        session.continuous_output = True
+
+        calls = {"n": 0}
+        original = ring.wait_for_data
+
+        def raiser(offset, generation, needed, timeout):
+            calls["n"] += 1
+            raise AssertionError("连续输出下不得等待预滚动（真机会白白阻塞 8 秒）")
+
+        ring.wait_for_data = raiser
+        try:
+            controller.output.do_play(record, record.client, token,
+                                      set_uri=True, play=True)
+        finally:
+            ring.wait_for_data = original
+
+        self.assertEqual(calls["n"], 0,
+                         "连续输出下 do_play 不得调用 wait_for_data（否则 seek 时阻塞 8 秒）")
 
 
 # --------------------------------------------------------------- 缺陷 C

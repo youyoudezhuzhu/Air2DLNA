@@ -1,5 +1,5 @@
 appname                    = air2dlna
-version                    = 1.0.25
+version                    = 1.0.26
 display_name               = Air2DLNA
 desc                       = Air2DLNA：把任意 DLNA/UPnP 音响变成 AirPlay 2 音箱。应用原生运行在飞牛 NAS 上（不使用 Docker），内置 AirPlay 2 接收器，把 Apple 设备推来的音频实时转成 PCM 流经 HTTP 推送到局域网 DLNA MediaRenderer，并提供 Web UI 管理 AirPlay 名称、DLNA 设备选择、播放状态与日志。
 platform                   = x86
@@ -16,4 +16,4 @@ service_port               = 8788
 checkport                  = true
 ctl_stop                   = true
 disable_authorization_path = true
-changelog                  = 1.0.25 修复「拖动进度条后完全没有声音」（1.0.24 遗留，每次都会命中）。根因：_can_reuse_generation() 决定 pbeg 时是否沿用当前 DLNA 会话，却只看 Virtual Player 自己的状态与会话 closed 标志，**从不看渲染器是否真的还在播放/还在拉流，也从不看 Renderer Profile**。真机日志实证：21:26:33「pbeg：曲目位置连续（变化 0 ms），沿用当前 DLNA 会话」→「沿用当前 DLNA 会话 gen=4（不重建、不重设 URI）」，紧接着 21:26:34「连续输出静音超时：进入 RECOVERING（渲染器=STOPPED 拉流连接=0）」——渲染器已是 STOPPED、没有任何 HTTP 客户端在拉流，我们却既不 SetAVTransportURI 也不 Play，没有任何人会去播放，音箱因此永远无声。拖进度条时 iPhone 会先 pend 再重建会话，这段空窗里渲染器必然已 STOPPED，所以每次拖进度条都命中。修复：补两道闸——① Renderer Profile 的 resume_requires_reannounce（真机 S12 = True，该字段此前是**死字段**，全代码无人使用）声明恢复必须重新宣告时一律不沿用；② 渲染器必须真的还在播（非 STOPPED）且确实有 HTTP 客户端在拉流，否则「沿用」等于没人播。另保留反向对照测试，确保不是把「沿用」简单改成永远 False（那会导致每次 pbeg 都换代、音箱重复缓冲）。新增 4 项回归测试并补上 2 个既有测试的前置条件（沿用的前提是渲染器可继续播放，此前该前提从未被建立）；单元测试 186/186、集成测试 42/42 通过。<br/>
+changelog                  = 1.0.26 修复「拖动进度条后长期无声」的真正瓶颈：**连续输出下预滚动等待阻塞了 SetAVTransportURI**。真机实测（1.0.25）：换代 → SetAVTransportURI 的延迟在非 seek 重建时为 1~2 秒，而两次 seek 都是**整整 8.0 秒**（do_play 里 ring.wait_for_data(..., timeout=8.0) 的预滚动超时）。原因：seek 之后 iPhone 要 10~20 秒才重新送出音频，而这段等待被原封不动地加在 SetAVTransportURI **之前** —— 等待期间渲染器处于 STOPPED、用户完全无声。输出层本来就会用静音填充空窗（ARCHITECTURE_V2 第 6/7 节），因此连续输出下改为**立即宣告 URI**：让渲染器尽早开始拉流，PCM 一到就无缝接上；非连续输出路径保留原有预滚动行为不变。新增针对性测试（连续输出下断言 do_play 绝不调用 wait_for_data）。同时如实记录：1.0.25 相对 1.0.24 **性能回退**，原因是 1.0.25 收紧了 _can_reuse_generation（Profile resume_requires_reannounce + 渲染器状态/客户端校验），使换代更频繁，而每次换代在 seek 时都要吃满 8 秒预滚动等待 ——两者叠加导致更慢；本次去掉 8 秒阻塞后该叠加效应消除。另附 docs/SEEK_ISSUE_ANALYSIS.md（完整取证与分析材料）。单元测试 187/187 通过。<br/>
