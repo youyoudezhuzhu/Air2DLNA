@@ -1185,16 +1185,54 @@ class VirtualPlayer:
             log.debug("清除暂停恢复状态（%s）", reason)
 
     def _can_reuse_generation(self) -> bool:
-        """``pbeg`` 时判断能否沿用当前 DLNA 会话。"""
+        """``pbeg`` 时判断能否沿用当前 DLNA 会话。
+
+        真机 bug（1.0.24，拖进度条后完全无声）：这里原先只看 Virtual Player **自己的**
+        状态与会话是否 closed，从不看渲染器是否真的还在播放/还在拉流，也从不看
+        Renderer Profile。于是出现下面这条致命序列（真机日志）：
+
+            21:26:33 pbeg：曲目位置连续（变化 0 ms），沿用当前 DLNA 会话
+            21:26:33 pbeg：沿用当前 DLNA 会话 gen=4（不重建、不重设 URI）
+            21:26:34 连续输出静音超时：进入 RECOVERING（渲染器=STOPPED 拉流连接=0）
+
+        渲染器已经是 STOPPED、**没有任何 HTTP 客户端在拉流**，我们却「沿用会话」既不
+        SetAVTransportURI 也不 Play —— 没有任何人会去播放，音箱永远无声。
+        seek 之后 iPhone 会先 pend 再重建会话，这段空窗里渲染器必然已经 STOPPED，
+        所以每次拖进度条都会命中。
+
+        现在补两道闸：
+          ① Renderer Profile 的 ``resume_requires_reannounce``（真机 S12 = True）——
+             该设备恢复时必须重新宣告，一律不沿用（此前该字段是**死字段**，无人使用）；
+          ② 渲染器必须真的还在播且确实有客户端在拉流，否则「沿用」等于没人播。
+        """
         with self._lock:
             token = self.output.gen_token
             stopped = self.state.state == STOPPED
             baseline = self._position_at_stream_boundary
+            renderer_state = self.state.renderer_state
         if stopped or not token:
             return False
         session = self.streams.get(token)
         if session is None or session.closed:
             return False
+
+        # 闸①：Profile 声明该设备恢复必须重新宣告（真机 S12：Pause 实为 Stop 且丢弃 HTTP）
+        try:
+            profile = self.output.profile()
+        except Exception:  # noqa: BLE001 - 取不到 Profile 不得影响播放决策
+            profile = None
+        if profile is not None and getattr(profile, "resume_requires_reannounce", False):
+            log.info("pbeg：Profile(%s) 声明 resume_requires_reannounce=True，"
+                     "不能沿用会话，改为重新宣告（SetAVTransportURI+Play）", profile.name)
+            return False
+
+        # 闸②：渲染器必须真的在播、且真的有客户端在拉流
+        clients = getattr(session, "clients", 0)
+        if renderer_state == RENDERER_STOPPED or clients <= 0:
+            log.info("pbeg：渲染器无法继续播放（renderer=%s 拉流连接=%d），"
+                     "不能沿用会话，改为重新宣告", renderer_state, clients)
+            return False
+
         now = time.monotonic()
         if now - self._handled_seek_at <= self.SEEK_REUSE_WINDOW_SECONDS:
             log.info("pbeg：%.1fs 前刚处理过真实 seek（已换代），沿用当前 DLNA 会话",

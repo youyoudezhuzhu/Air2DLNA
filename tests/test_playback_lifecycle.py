@@ -258,6 +258,11 @@ class PendTransitionTests(unittest.TestCase):
         """
         controller, _, ring, timeline, _, streams = _build()
         controller._handle_play(False)
+        # 沿用的前提（1.0.25 起显式校验）：渲染器确实还在 PLAYING、且确实有客户端在拉流。
+        # 真机 bug：渲染器已 STOPPED、拉流连接=0 时仍被「沿用」→ 既不 SetURI 也不 Play
+        # → 没有任何人会播放，音箱永远无声。
+        controller.state.renderer_state = state_mod._RENDERER_PLAYING
+        streams.get(controller._gen_token).clients = 1
         generation_before = ring.generation
         created_before = len(streams.created)
         _observe(controller, timeline, 30.0, 27000.0)      # 位置偏差仅约 3 秒（缓冲延迟量级）
@@ -292,6 +297,9 @@ class PendTransitionTests(unittest.TestCase):
         controller._handle_play(False)
         _observe(controller, timeline, 30.0, 27000.0)
         controller._handle_flush("12345")                    # 真实 seek → 换代
+        # 前置条件同上：换代后渲染器仍在外拉流时才有「不要重复换代」的诉求
+        controller.state.renderer_state = state_mod._RENDERER_PLAYING
+        streams.get(controller._gen_token).clients = 1
 
         generation_after_seek = ring.generation
         created_after_seek = len(streams.created)

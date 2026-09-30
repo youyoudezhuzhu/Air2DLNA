@@ -43,6 +43,8 @@ from air2dlna.ringbuffer import PcmRingBuffer            # noqa: E402
 from air2dlna.stream import StreamManager                 # noqa: E402
 from air2dlna.renderer_profile import profile_for, select_profile  # noqa: E402
 
+from air2dlna import state as state_mod                    # noqa: E402
+
 from test_virtual_player import (                         # noqa: E402
     BYTE_RATE, CHANNELS, SAMPLE_RATE, _Record, build_controller,
 )
@@ -232,6 +234,63 @@ class KeepaliveProfileVetoTests(unittest.TestCase):
         config["recovery_mode"] = "keepalive"
         self.assertTrue(controller._keepalive_allowed(),
                         "generic（保守假设 supports_pause=True）不应被否决")
+
+
+# --------------------------------------------------------------- 拖进度条后无声
+class SeekReannounceTests(unittest.TestCase):
+    """拖进度条后 iPhone 会 pend → 重建会话 → pbeg/prsm，这段空窗里渲染器必然已 STOPPED。
+
+    真机日志（1.0.24，每次拖进度条都会命中）::
+
+        21:26:33 pbeg：曲目位置连续（变化 0 ms），沿用当前 DLNA 会话
+        21:26:33 pbeg：沿用当前 DLNA 会话 gen=4（不重建、不重设 URI）
+        21:26:34 连续输出静音超时：进入 RECOVERING（渲染器=STOPPED 拉流连接=0）
+
+    渲染器已 STOPPED、拉流连接=0，却「沿用会话」既不 SetAVTransportURI 也不 Play ——
+    没有任何人会去播放，音箱永远无声。
+    """
+
+    def test_renderer_stopped_must_not_reuse(self):
+        controller, _c, _ring, _t, _r, streams = build_controller(model="")
+        controller._handle_play(False)
+        controller.state.renderer_state = state_mod._RENDERER_STOPPED
+        streams.get(controller._gen_token).clients = 3
+        self.assertFalse(controller._can_reuse_generation(),
+                         "渲染器已 STOPPED 时不得沿用会话（否则无人播放）")
+
+    def test_no_http_client_must_not_reuse(self):
+        controller, _c, _ring, _t, _r, streams = build_controller(model="")
+        controller._handle_play(False)
+        controller.state.renderer_state = state_mod._RENDERER_PLAYING
+        streams.get(controller._gen_token).clients = 0
+        self.assertFalse(controller._can_reuse_generation(),
+                         "没有任何客户端在拉流时不得沿用会话")
+
+    def test_positive_control_reuse_still_allowed_when_renderer_can_continue(self):
+        """反向对照：渲染器在播且有客户端时，沿用仍然必须被允许。
+
+        防止把 _can_reuse_generation 改成「永远返回 False」这种假修复
+        （那会让每次 pbeg 都换代，音箱重复缓冲 → 真机卡顿）。
+        """
+        controller, _c, _ring, _t, _r, streams = build_controller(model="")
+        controller._handle_play(False)
+        controller.state.renderer_state = state_mod._RENDERER_PLAYING
+        streams.get(controller._gen_token).clients = 1
+        self.assertTrue(controller._can_reuse_generation(),
+                        "渲染器可继续播放且位置连续时应允许沿用会话")
+
+    def test_s12_profile_never_reuses_because_resume_needs_reannounce(self):
+        """S12 的 resume_requires_reannounce=True 此前是**死字段**，无人使用。"""
+        controller, _c, ring, _t, _r, streams = build_controller(model="S12")
+        controller._handle_play(False)
+        controller.state.renderer_state = state_mod._RENDERER_PLAYING
+        streams.get(controller._gen_token).clients = 5
+        self.assertFalse(controller._can_reuse_generation(),
+                         "S12 恢复必须重新宣告（supports_pause=False → Pause 实为 Stop）")
+        generation_before = ring.generation
+        controller._handle_play(False)               # 紧随的 pbeg
+        self.assertGreater(ring.generation, generation_before,
+                           "S12 的 pbeg 必须换代并重新宣告，否则拖进度条后无声")
 
 
 if __name__ == "__main__":
