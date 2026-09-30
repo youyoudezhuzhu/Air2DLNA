@@ -387,17 +387,35 @@ class PendTransitionTests(unittest.TestCase):
 class RebuildSourceTests(unittest.TestCase):
     """需求 4：只允许三类原因更换媒体生命周期。"""
 
-    def test_seek_rebuilds_exactly_once(self) -> None:
+    def test_seek_holds_session_instead_of_rebuilding(self) -> None:
+        """SEEK 实验（1.0.27）：seek 只 flush 旧 PCM，**保持** DLNA 会话与 URI。
+
+        旧行为是「Stop + 新 generation + 新 URI + SetAVTransportURI + Play」，
+        即 seek 必须恰好新建一个流。真机证据表明这条路走不通：seek 之后 AirPlay 有
+        10~20 秒没有 PCM，而我们主动拆掉了渲染器正在用的 HTTP 连接并重建播放生命周期，
+        渲染器建好之后只能空转，随后自行 STOPPED（真机日志里 PCM 刚一恢复它就
+        `STOPPED / 拉流连接=0`）。
+
+        现在改为：flush 环形缓冲（新 generation）+ **沿用同一会话与 URI**，
+        由连续输出的静音撑过空窗，PCM 到达后同一个 HTTP 连接直接继续输出。
+        因此 seek 期间**不应**出现任何新流、也不应下发 SetAVTransportURI。
+        """
         controller, _, ring, _, _, streams = _build()
         controller._handle_play(False)
         generation_before = ring.generation
         created_before = len(streams.created)
+        uri_before = controller._uri_count
 
         controller._handle_flush("12345")   # pfls：真实 seek
 
-        self.assertEqual(generation_before + 1, ring.generation, "seek 应换代一次")
-        self.assertEqual(created_before + 1, len(streams.created), "seek 只允许一次新流")
-        self.assertEqual("flush", controller._last_rebuild_reason)
+        self.assertEqual(generation_before + 1, ring.generation,
+                         "seek 仍应换代一次（音频内容必须换到新位置）")
+        self.assertEqual(created_before, len(streams.created),
+                         "SEEK 实验：seek 不得新建流（必须保持原会话与 URI）")
+        self.assertEqual(uri_before, controller._uri_count,
+                         "SEEK 实验：seek 不得下发 SetAVTransportURI")
+        self.assertTrue(controller._in_seek_hold(), "seek 后应进入保持窗口")
+        self.assertEqual(state_mod.SEEKING, controller.machine_state)
 
     def test_stalled_renderer_rebuilds(self) -> None:
         # 渲染器声称在播放，但 8 秒以上没人拉流 → 允许兜底重建
@@ -844,11 +862,22 @@ class PauseKeepaliveTests(unittest.TestCase):
 
 
 class ResumeInPlaceGuardTests(unittest.TestCase):
-    """原地续播（只发 Play）的前置条件 —— 真机「seek/快速恢复后无声」的根因。"""
+    """原地续播（只发 Play）的前置条件 —— 真机「seek/快速恢复后无声」的根因。
 
-    def test_renderer_stopped_forces_rebuild(self) -> None:
-        # 固件把 Pause 做成 Stop：此时只发 Play 会"假播放"，必须换代
-        controller, _, ring, timeline, _, streams = _build()
+    注：1.0.27 起默认开启 SEEK 实验（``seek_keep_session``），「渲染器已 STOPPED」
+    与「位置跳变」不再换代，而是进入 seek 保持窗口（保持会话与 URI）。
+    这两条断言旧行为的用例改为在 ``seek_keep_session=False`` 下运行，
+    以同时锁定「实验开关关闭时可回到旧行为」这条回退路径。
+    """
+
+    @staticmethod
+    def _disable_experiment(config) -> None:
+        config["seek_keep_session"] = False
+
+    def test_renderer_stopped_forces_rebuild_when_experiment_off(self) -> None:
+        # 固件把 Pause 做成 Stop：实验关闭时仍必须换代（旧行为，回退路径）
+        controller, config, ring, timeline, _, streams = _build()
+        self._disable_experiment(config)
         controller._handle_play(False)
         _observe(controller, timeline, 30.0, 27000.0)
         controller._handle_pause()
@@ -862,9 +891,26 @@ class ResumeInPlaceGuardTests(unittest.TestCase):
         self.assertEqual(generation_before + 1, ring.generation, "渲染器已 STOPPED 时必须换代")
         self.assertEqual(created_before + 1, len(streams.created), "必须换新 URI")
 
-    def test_position_jump_forces_rebuild(self) -> None:
-        # 拖动进度条：渲染器仍是 PAUSED，但曲目位置跳变 → 不能原地续播
-        controller, _, ring, timeline, _, streams = _build()
+    def test_renderer_stopped_keeps_session_when_experiment_on(self) -> None:
+        """SEEK 实验开启（默认）：保持会话与 URI，进入保持窗口，等 PCM 自然接上。"""
+        controller, _config, ring, timeline, _, streams = _build()
+        controller._handle_play(False)
+        _observe(controller, timeline, 30.0, 27000.0)
+        controller._handle_pause()
+        with controller._lock:
+            controller.state.renderer_state = state_mod._RENDERER_STOPPED
+        created_before = len(streams.created)
+
+        controller._handle_play(True)
+
+        self.assertTrue(controller._in_seek_hold(), "应进入 seek 保持窗口")
+        self.assertEqual(created_before, len(streams.created),
+                         "SEEK 实验：不得新建流（保持原 URI）")
+
+    def test_position_jump_forces_rebuild_when_experiment_off(self) -> None:
+        # 拖动进度条：实验关闭时，位置跳变 → 必须换代（旧行为）
+        controller, config, ring, timeline, _, streams = _build()
+        self._disable_experiment(config)
         controller._handle_play(False)
         _observe(controller, timeline, 30.0, 27000.0)
         controller._handle_pause()

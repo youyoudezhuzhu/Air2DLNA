@@ -73,6 +73,9 @@ DEFAULTS: dict[str, Any] = {
     "maximum_buffer_ms": 1800,
     # 连续 HTTP 媒体输出（第 6 节）：DLNA 播放期间真实 PCM 不足时用静音填充，不 EOF。
     "continuous_output": True,
+    # SEEK 实验开关（1.0.27）：seek 时保持 DLNA 会话与 URI，不 Stop/不 SetURI。
+    # 设为 false 可回到「Stop + 新 URI + SetAVTransportURI」的旧行为做 A/B 对照。
+    "seek_keep_session": True,
     # 连续输出下真实 PCM 中断多久后进入 RECOVERING（秒，第 8 节）
     "silence_timeout_seconds": 8,
     # 反向控制（DACP）网络超时（秒，第 20 节）；每项能力仍独立检测
@@ -105,6 +108,7 @@ EDITABLE_KEYS = {
     "target_buffer_ms",
     "maximum_buffer_ms",
     "continuous_output",
+    "seek_keep_session",
     "silence_timeout_seconds",
     "dacp_timeout_seconds",
     "reverse_control_enabled",

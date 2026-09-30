@@ -180,6 +180,9 @@ class StreamSession:
     on_bytes: Optional[Callable[[int], None]] = None
     #: 建连回调（控制器用它记录恢复耗时里的 T8：渲染器对新 URI 发起 GET）
     on_connect: Optional[Callable[[], None]] = None
+    #: 断连回调（SEEK 实验打点用：记录「HTTP 连接被关闭」的时刻 T7）。
+    #: 与渲染器上报 STOPPED（T8）分开记录，用于判定到底是渲染器先停还是我们先断。
+    on_close: Optional[Callable[[], None]] = None
     #: 暂停 keepalive（方案 A）：为真时输出层改为持续发送静音 PCM。
     #: **静音只在输出层生成，绝不写入环形缓冲** —— 环形缓冲承载的是 AirPlay 真实
     #: 时间线，不能被合成音频污染（否则位置/seek/时间线全部失真）。
@@ -425,6 +428,7 @@ class StreamManager:
                         session.closed = False
                         session.generation = newest
                         offset = 0
+                        sent_conn = 0          # 新一代 = 新资源，字节预算重新计算
                         silence_since = None
                         continue
                     break
@@ -470,6 +474,7 @@ class StreamManager:
                             session.token, session.generation, newest)
                         session.generation = newest
                         offset = 0
+                        sent_conn = 0          # 新一代 = 新资源，字节预算重新计算
                         silence_since = None
                         continue
                     log.info("流已换届，主动断开旧连接: token=%s", session.token)
@@ -568,6 +573,11 @@ class StreamManager:
                 try:
                     close_callback()
                 except Exception:  # noqa: BLE001
+                    pass
+            if session.on_close is not None:
+                try:
+                    session.on_close()
+                except Exception:  # noqa: BLE001 - 诊断回调不得影响推流
                     pass
             log.info(
                 "渲染器拉流结束: token=%s 本次连接 %.1fs（本 token 累计 %.1fs，共 %d 次连接）",

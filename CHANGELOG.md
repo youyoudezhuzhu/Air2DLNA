@@ -5,6 +5,72 @@
 
 ---
 
+## 1.0.27 — SEEK 实验版：seek 时保持 DLNA 会话（单变量 A/B）
+
+按外部分析（ChatGPT）结论，把「seek 后彻底无声」的**头号嫌疑**做成可验证的最小实验。
+
+### 为什么怀疑「主动 Stop + 重建」而不是 AirPlay
+1. **seek 从不发 `pfls`/`pdis`**（真机实测计数为 0）。它表现为
+   「暂停 → 恢复且曲目位置跳变」，命中的是 `_handle_play` 的 `resume-rebuild` 分支。
+2. 该分支的旧行为是 **Stop + 新 generation + 新 URI + `SetAVTransportURI`** ——
+   也就是**主动拆掉渲染器正在使用的 HTTP 连接**，逼它重建整个播放生命周期。
+3. 而 AirPlay 此刻要 **10~20 秒**才重新送出 PCM。渲染器在这段空窗里建好即空转，
+   随后自行 `STOPPED`（日志：`真实 PCM 恢复` 之后紧接着 `渲染器=STOPPED 拉流连接=0`）。
+
+结论：**「AirPlay 没有 PCM」和「S12 停止播放」之间，我们主动插入了拆连接与重建。**
+
+### 实验内容（只改这一个变量）
+```
+Seek
+ └─ 只 flush 旧 PCM（新 generation）
+    保持 DLNA 会话与 URI 不变      ← 不 Stop、不 SetAVTransportURI、不换 URI
+    渲染器**现有的** HTTP 连接自动跟随到新 generation
+    空窗期间由输出层连续发送静音
+    PCM 到达后同一连接无缝继续输出
+```
+* 保持窗口 **30 秒**；窗口内「静音超时」不再触发 `RECOVERING`/换代
+  （否则 8 秒就会打断 30 秒的等待，实验自变量被破坏）。
+* 新增配置 `seek_keep_session`（默认 `true`）。设为 `false` 可**一键回到旧行为**做对照。
+
+### 新增 T0~T9 打点（判定「谁先死」）
+| 打点 | 含义 |
+|---|---|
+| T0 | seek 检测 |
+| T1 | 是否发送 `AVTransport#Stop`（实验中应为「未发送」） |
+| T2 | 是否发送 `SetAVTransportURI`（实验中应为「未发送」） |
+| T4 | 渲染器发起 HTTP GET |
+| T5 | 首个静音字节 |
+| **T6** | **首个真实 PCM 字节** |
+| T7 | HTTP 连接被关闭 |
+| T8 | 渲染器 TransportState → STOPPED |
+| T9 | 保持窗口结束 |
+
+报告末尾会显式给出两个关键间隔：
+
+* **T6→T7**：如果是我们先关闭了连接 ⇒ 本方的连接生命周期问题；
+* **T6→T8**：如果是渲染器先转入 STOPPED ⇒ 设备对流媒体的兼容性限制。
+
+### stream 层修正
+跟随新 generation 时**重置本连接的字节预算**。同一 HTTP 连接跨代输出时，
+旧实现会按旧代的 `total_bytes` 提前结束连接（因为 seek 实验正是让连接跨代存活，
+这个 bug 会直接破坏实验）。
+
+### 验证
+* 单元测试 **192/192** 通过，含实验开关**两侧**的用例
+  （`test_renderer_stopped_keeps_session_when_experiment_on` /
+  `..._forces_rebuild_when_experiment_off`），确保回退路径可用。
+* `tests/test_playback_lifecycle.py` 的 `RebuildSourceTests.test_seek_rebuilds_exactly_once`
+  按实验改为 `test_seek_holds_session_instead_of_rebuilding`。
+
+### 如何判读结果
+* **实验成功**（seek → 十几秒静音 → PCM → 正常出声）⇒ 坐实根因是
+  「在 AirPlay 无 PCM 的窗口里主动重建了 S12 承受不住的 DLNA 播放生命周期」。
+* **实验失败**（静音 → PCM → 仍 `STOPPED`）⇒ 看 T6→T8：若极短，说明 S12 拿到 PCM
+  之后仍主动结束会话，属设备兼容性；下一步应做 **WAV vs L16**、`Content-Length`、
+  chunked、DIDL 等**独立单变量**对照（不要与本实验混在同一个版本里）。
+
+---
+
 ## 1.0.25 — 修复「拖动进度条后完全没有声音」
 
 1.0.24 解决了暂停/恢复延迟（5~6 秒 → 约 3 秒），但**拖进度条后无声**依然存在。根因已定位：

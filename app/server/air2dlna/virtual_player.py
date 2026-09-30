@@ -75,6 +75,46 @@ MACHINE_BUFFERING = "BUFFERING"
 MACHINE_PLAYING = "PLAYING"
 MACHINE_PAUSED = "PAUSED"
 SEEKING = "SEEKING"
+
+#: SEEK 实验（ARCHITECTURE_V2 后续）：seek 后**保持**当前 DLNA 会话与 HTTP 连接，
+#: 不做 Stop / 不 SetURI / 不换 URI，靠连续输出的静音撑过 AirPlay 的空窗，
+#: 等新 PCM 到达后由同一个 HTTP 连接直接继续输出。
+#: 真机实测 seek 后 iPhone 需要 10~20 秒才重新送出音频，因此保持窗口取 30 秒。
+SEEK_HOLD_SECONDS = 30.0
+
+
+class _SeekTimeline:
+    """SEEK 实验的分段打点（T0~T9），用于判定「谁先死」。
+
+    关键比较：**T6（首个真实 PCM 字节）之后**，是渲染器先转入 STOPPED（T8），
+    还是我们先关闭 HTTP 连接（T7）。这能区分两种完全不同的根因：
+
+    * T6 → T8 极短  ⇒ 渲染器拿到 PCM 之后仍然主动结束会话（设备兼容性问题）；
+    * T6 → T7 极短  ⇒ 是我们自己的连接生命周期把播放拆掉了（本方 bug）。
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.t0 = time.monotonic()
+        self.reason = reason
+        self.marks: list[tuple[str, float, str]] = []
+
+    def mark(self, name: str, detail: str = "") -> None:
+        self.marks.append((name, time.monotonic() - self.t0, detail))
+
+    def report(self) -> str:
+        lines = [f"=== SEEK 实验打点（{self.reason}）==="]
+        for name, dt, detail in self.marks:
+            lines.append(f"  {name:<28} T+{dt * 1000:>7.0f} ms  {detail}")
+        # 显式给出关键间隔
+        by = {name: dt for name, dt, _ in self.marks}
+        t6 = by.get("T6_first_real_pcm")
+        for key, label in (("T7_http_closed", "T6→T7 HTTP 关闭"),
+                           ("T8_renderer_stopped", "T6→T8 渲染器 STOPPED")):
+            if t6 is not None and key in by:
+                lines.append(f"  ** {label:<24} = {(by[key] - t6) * 1000:>7.0f} ms")
+            elif t6 is not None:
+                lines.append(f"  ** {label:<24} = 未发生")
+        return "\n".join(lines)
 TRACK_SWITCHING = "TRACK_SWITCHING"
 RECOVERING = "RECOVERING"
 STOPPING = "STOPPING"
@@ -349,6 +389,16 @@ class VirtualPlayer:
         self._keepalive_capable: dict[str, bool] = {}
         #: 是否已就「Profile 声明不支持暂停 → keepalive 不适用」记录过一次日志
         self._keepalive_profile_warned = False
+        #: SEEK 实验：保持窗口的截止时刻（>now 表示正处在 seek 保持窗口内）
+        self._seek_hold_until = 0.0
+        #: SEEK 实验打点
+        self._seek_timeline: Optional[_SeekTimeline] = None
+        #: SEEK 实验期间被复用（而非重建）的会话 token
+        self._seek_hold_token = ""
+        #: 渲染器是否已被观察到 STOPPED（用于 T8 只在首次跳变时记录）
+        self._seek_seen_renderer_stopped = False
+        #: 音频线程观察到 seek 后首个真实 PCM（由轮询线程消费）
+        self._seek_pcm_seen = False
         #: 暂停状态下累计收到的 PCM 字节数（用于「AirPlay 已恢复但没有事件」的兜底）
         self._paused_audio_bytes = 0
         #: keepalive 期间连续没有客户端的采样次数（用于判定断流）
@@ -593,6 +643,12 @@ class VirtualPlayer:
     def on_audio_bytes(self, data: bytes) -> None:
         """音频读取线程回调：把 FIFO 数据推进环形缓冲。"""
         self.ring.append(data)
+        # ★ SEEK 实验 T6：seek 之后第一个真实 PCM 字节。
+        # 这里**只打点、不做任何网络操作**（音频线程纪律），实际结束保持窗口交给轮询线程。
+        if self._seek_timeline is not None and len(data) > 0:
+            if not any(m[0] == "T6_first_real_pcm" for m in self._seek_timeline.marks):
+                self._seek_timeline.mark("T6_first_real_pcm", f"{len(data)} bytes")
+                self._seek_pcm_seen = True
         # 兜底：暂停期间持续收到 PCM，说明 AirPlay 其实已经恢复（真机实测拖动进度条时
         # AirPlay 可能**完全不发** pres/pbeg/pfls 任何事件），此时只靠事件永远醒不过来。
         # 这里只做计数，实际恢复动作交给轮询线程（不在音频线程里做网络操作）。
@@ -749,6 +805,12 @@ class VirtualPlayer:
         if confirmed is not None:
             log.info("DLNA 发起的 Play 已由 AirPlay 确认（request_id=%s）",
                      confirmed.get("request_id"))
+        if self._in_seek_hold():
+            # ★ SEEK 实验：保持窗口内不重建、不 SetURI（自变量）。
+            if self._seek_timeline is not None:
+                self._seek_timeline.mark("play_during_hold", "保持窗口内不重建、不 SetURI")
+            log.info("SEEK 实验：保持窗口内收到播放事件，保持当前会话不动（等 PCM）")
+            return
         if is_resume and self._silence_active:
             # keepalive(方案A) 的恢复：渲染器一直在 PLAYING、URI 从未改变，
             # 因此**不做任何 UPnP 操作**，只把输出层切回真实 PCM 即可。
@@ -799,6 +861,17 @@ class VirtualPlayer:
             elif token:
                 # 其它情况（渲染器其实已 STOPPED、或位置跳变/seek）：
                 # 只发 Play 会"假播放"（无声），必须换代重建。
+                if self._seek_experiment_enabled():
+                    # ★ SEEK 实验：真机 seek **不会**发 pfls/pdis（实测计数为 0），
+                    # 它表现为「暂停 → 恢复且曲目位置跳变」，正好命中这条 resume-rebuild
+                    # 分支。旧实现会在这里换代 + 新 URI + SetAVTransportURI，把渲染器
+                    # 正在用的 HTTP 连接拆掉重建；而 AirPlay 此刻要 10~20 秒才有 PCM，
+                    # 于是渲染器建好即空转、随后自行 STOPPED。
+                    # 改为：保持会话与 URI，只 flush 旧 PCM，由静音撑过空窗。
+                    log.info("恢复播放：渲染器状态=%s 不满足原地续播（或位置跳变）"
+                             "→ SEEK 实验：保持会话与 URI，不重建", self.state.renderer_state)
+                    self._begin_seek_hold("resume-position-jump")
+                    return
                 log.info("恢复播放：渲染器状态=%s 不满足原地续播（或位置跳变），"
                          "换代重建（新 generation 的 0 点 = 当前 AirPlay 位置）",
                          self.state.renderer_state)
@@ -898,6 +971,91 @@ class VirtualPlayer:
     def _keepalive_udn(self) -> str:
         record = self.registry.selected()
         return record.udn if record is not None else ""
+
+    def _in_seek_hold(self) -> bool:
+        """是否处于 SEEK 保持窗口（此时**禁止** Stop / SetURI / 换代重建）。"""
+        return time.monotonic() < self._seek_hold_until
+
+    def _begin_seek_hold(self, payload: str) -> None:
+        """SEEK 实验：flush 旧 PCM，但**保持当前 DLNA 会话与 HTTP 连接不变**。
+
+        与旧实现的差别（旧实现 = Stop + 新 generation + 新 URI + SetURI + Play）：
+
+        * 不发送 ``AVTransport#Stop`` —— 不去拆渲染器已经在用的 HTTP 连接；
+        * 不调用 :meth:`_start_dlna_session` —— URI/token 保持不变；
+        * 只 :meth:`_begin_new_generation`（flush 环形缓冲、新 generation）；
+        * 渲染器**现有的** HTTP 连接会自动跟随到新 generation
+          （``stream.serve`` 的「按实时流语义跟随最新一代」），
+          没有真实 PCM 时由输出层送静音，PCM 到达后无缝继续输出。
+        """
+        session = self.streams.get(self.output.gen_token)
+        self._seek_hold_token = getattr(session, "token", "") or ""
+        self._seek_hold_until = time.monotonic() + SEEK_HOLD_SECONDS
+        self._seek_seen_renderer_stopped = False
+        self._seek_timeline = _SeekTimeline("seek-hold")
+        self._seek_timeline.mark("T0_seek_detected", f"frame={payload or '?'} token={self._seek_hold_token}")
+        if session is not None:
+            # T4：渲染器对同一 URI 再次发起 GET（连接生命周期观测）
+            previous_connect = session.on_connect
+
+            def _on_connect() -> None:
+                if self._seek_timeline is not None:
+                    self._seek_timeline.mark("T4_renderer_get")
+                if previous_connect is not None:
+                    try:
+                        previous_connect()
+                    except Exception:  # noqa: BLE001
+                        pass
+
+            session.on_connect = _on_connect
+            # T7：HTTP 连接被关闭
+            def _on_close() -> None:
+                if self._seek_timeline is not None:
+                    self._seek_timeline.mark("T7_http_closed")
+
+            session.on_close = _on_close
+        self._handled_seek_at = time.monotonic()
+        log.info(
+            "SEEK 实验：检测到 seek/flush (frame=%s) —— **保持 DLNA 会话 %s（不 Stop、不 SetURI、"
+            "不换 URI）**，flush 旧 PCM 后由同一 HTTP 连接继续输出（无 PCM 时送静音），"
+            "保持窗口 %.0fs", payload or "?", self._seek_hold_token or "?", SEEK_HOLD_SECONDS)
+        self._begin_new_generation(reason="seek-hold", offset_ms=None)
+        self._enter(SEEKING, reason="seek-hold")
+
+    def _finish_seek_hold(self, why: str) -> None:
+        timeline, self._seek_timeline = self._seek_timeline, None
+        self._seek_hold_until = 0.0
+        self._seek_hold_token = ""
+        if timeline is not None:
+            timeline.mark("T9_hold_end", why)
+            log.info("%s", timeline.report())
+
+    def _sample_seek_hold(self) -> None:
+        """轮询线程调用：记录 T5/T8、在 PCM 到达或窗口结束时收尾。
+
+        音频线程只负责置 ``_seek_pcm_seen``（那里不能做网络操作），
+        实际的收尾与状态切换都在这里完成。
+        """
+        if self._seek_timeline is None:
+            return
+        if self._seek_pcm_seen:
+            self._seek_pcm_seen = False
+            log.info("SEEK 实验：新 PCM 已到达，结束保持窗口并继续输出"
+                     "（会话 %s 全程未中断）", self._seek_hold_token or "?")
+            self._finish_seek_hold("PCM 到达")
+            self._enter(MACHINE_PLAYING, reason="seek-hold-pcm")
+            return
+        session = self.streams.get(self._seek_hold_token) if self._seek_hold_token else None
+        if session is not None and getattr(session, "silence_bytes", 0) > 0:
+            if not any(m[0] == "T5_first_silence" for m in self._seek_timeline.marks):
+                self._seek_timeline.mark("T5_first_silence")
+        with self._lock:
+            renderer_state = self.state.renderer_state
+        if renderer_state == RENDERER_STOPPED and not self._seek_seen_renderer_stopped:
+            self._seek_seen_renderer_stopped = True
+            self._seek_timeline.mark("T8_renderer_stopped")
+        if not self._in_seek_hold():
+            self._finish_seek_hold("保持窗口结束（未等到可用 PCM）")
 
     def _keepalive_allowed(self) -> bool:
         """该渲染器是否还有资格尝试 keepalive（Renderer Profile）。"""
@@ -1205,6 +1363,11 @@ class VirtualPlayer:
              该设备恢复时必须重新宣告，一律不沿用（此前该字段是**死字段**，无人使用）；
           ② 渲染器必须真的还在播且确实有客户端在拉流，否则「沿用」等于没人播。
         """
+        if self._in_seek_hold():
+            # ★ SEEK 实验：保持窗口内**必须**沿用当前会话（这正是实验的自变量）。
+            if self._seek_timeline is not None:
+                self._seek_timeline.mark("T2_no_seturi", "保持窗口内沿用会话，不 SetURI")
+            return True
         with self._lock:
             token = self.output.gen_token
             stopped = self.state.state == STOPPED
@@ -1251,6 +1414,16 @@ class VirtualPlayer:
 
     def _handle_pause(self) -> None:
         """``paus``：暂停。优先用 UPnP Pause（不换代、不 flush，恢复即可继续）。"""
+        if self._in_seek_hold():
+            # ★ SEEK 实验关键点：seek 过程中的「暂停」是 seek 的一部分。
+            # 旧实现会因为 S12 档案 supports_pause=False 而给渲染器发 AVTransport#Stop，
+            # 那会**拆掉它正在使用的 HTTP 连接**，逼它重建整个播放生命周期 ——
+            # 而此刻 AirPlay 恰好 10~20 秒没有 PCM，于是它建好就空转、随后自行 STOPPED。
+            if self._seek_timeline is not None:
+                self._seek_timeline.mark("T1_no_stop_sent", "保持窗口内，不发送 AVTransport#Stop")
+            log.info("SEEK 实验：保持窗口内收到暂停事件，**不向渲染器发送 Stop**"
+                     "（会话 %s 保持不变）", self._seek_hold_token or "?")
+            return
         confirmed = self._confirm_pending("pause")
         if confirmed is not None and confirmed.get("source") == SOURCE_DLNA:
             # 控制回环防护（第 19 节）：这个暂停是由 DLNA 端发起的，
@@ -1314,21 +1487,26 @@ class VirtualPlayer:
         self._cancel_transition("seek/flush")
         self._stop_pause_keepalive("seek")
         self._clear_pause_recovery("seek")
-        self._handled_seek_at = time.monotonic()
-        log.info("检测到 seek/flush (frame=%s)：换代并重锚 DLNA 会话", payload or "?")
-        self._enter(TRACK_SWITCHING if track_change else SEEKING, reason="flush")
         if confirmed is not None:
             log.info("DLNA 发起的 Seek 已由 AirPlay 确认（request_id=%s）；"
                      "按新的 AirPlay 位置重建输出，不重复下发反向 Seek",
                      confirmed.get("request_id"))
-        self._begin_new_generation(reason="flush", offset_ms=None)
         with self._lock:
             self._pending_reanchor = True
-        # AirPlay 侧的新位置通过随后的 prgr 得知，preroll 期间即可修正
-        self._start_dlna_session(reason="seek")
+        # ★ SEEK 实验：不再 Stop / 不再新 URI / 不再 SetAVTransportURI。
+        # 只 flush 旧 PCM 并保持当前 DLNA 会话与 HTTP 连接，由连续输出撑过 AirPlay 空窗。
+        # （旧实现：_begin_new_generation + _start_dlna_session(reason="seek")）
+        self._begin_seek_hold(payload)
 
     def _handle_play_stream_end(self, reason: str) -> None:
         """``pend``：AirPlay 播放流结束 —— **不等价于**整个会话结束。"""
+        if self._in_seek_hold():
+            # seek 之后 iPhone 会在十几秒后补发 pend。保持窗口内一律不进入过渡态、
+            # 不停止会话，继续等 PCM（否则会把 seek 误判成「播放结束」）。
+            if self._seek_timeline is not None:
+                self._seek_timeline.mark("pend_during_hold", "保持窗口内忽略 pend")
+            log.info("SEEK 实验：保持窗口内收到 pend（%s），不做过渡/停止，继续等待 PCM", reason)
+            return
         with self._lock:
             if self.state.state == STOPPED:
                 log.info("AirPlay 播放流结束（%s）；当前已是停止态，无需过渡", reason)
@@ -1497,6 +1675,8 @@ class VirtualPlayer:
                 self._check_transition_timeout()
                 # 暂停恢复（方案 A）的成功判定 / 超时 fallback
                 self._check_pause_recovery()
+                # SEEK 实验：采样 T5/T6/T8 并在 PCM 到达或窗口结束时收尾
+                self._sample_seek_hold()
                 # 兜底：暂停中却持续收到音频 → AirPlay 已恢复（无事件也生效）
                 self._check_resumed_without_event()
                 # keepalive（方案 A'）断流检测与超时退化（GPT Phase 2）
@@ -1538,13 +1718,27 @@ class VirtualPlayer:
             return 0.0
         return self.PAUSE_RECOVERY_RECONNECT_GRACE_SECONDS
 
+    def _seek_experiment_enabled(self) -> bool:
+        """SEEK 实验开关（配置 ``seek_keep_session``，默认开启）。
+
+        设为 false 可一键回到「Stop + 新 URI + SetAVTransportURI」的旧行为，
+        便于做单变量 A/B 对照。
+        """
+        value = self.config.get("seek_keep_session")
+        return True if value is None else bool(value)
+
     def _check_silence_timeout(self) -> None:
         """连续输出层报告真实 PCM 长时间中断 → RECOVERING。
 
         静音本身保证 HTTP 不断（第 6 节）；这里只在链路确实不可用时执行
         「new generation + SetAVTransportURI + Play」原语（第 8 / 26 节）。
         """
-        if not self.output.take_silence_timeout():
+        if self._in_seek_hold():
+            # ★ SEEK 实验：保持窗口内「没有真实 PCM」是**预期**的（AirPlay 需要
+            # 10~20 秒重建流）。若在这里因为静音超过 8 秒就进入 RECOVERING / 换代，
+            # 实验的自变量（保持会话）就被破坏了，而且会重演旧行为。
+            self.output.take_silence_timeout()   # 消费掉事件，避免窗口结束后立刻触发
+            log.info("SEEK 实验：保持窗口内静音属于预期，不进入 RECOVERING、不换代")
             return
         with self._lock:
             state_name = self.state.state

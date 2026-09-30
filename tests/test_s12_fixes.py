@@ -327,5 +327,64 @@ class SeekReannounceTests(unittest.TestCase):
                            "S12 的 pbeg 必须换代并重新宣告，否则拖进度条后无声")
 
 
+# --------------------------------------------------------------- SEEK 实验（1.0.27）
+class SeekHoldExperimentTests(unittest.TestCase):
+    """SEEK 实验：seek 时保持 DLNA 会话与 HTTP 连接，不 Stop、不 SetURI、不换 URI。
+
+    真机证据：seek 后 AirPlay 有 10~20 秒没有 PCM，而旧实现会主动 Stop 掉渲染器
+    正在用的 HTTP 连接并重建播放生命周期，渲染器建好即空转，随后自行 STOPPED
+    （日志里 PCM 刚恢复就 `渲染器=STOPPED 拉流连接=0`）。
+    """
+
+    def _playing(self, model="S12"):
+        controller, _cfg, ring, _tl, record, streams = build_controller(model=model)
+        controller._handle_play(False)
+        return controller, ring, record, streams
+
+    def test_seek_does_not_send_stop_even_for_s12_profile(self):
+        """S12 档案声明 supports_pause=False（暂停→Stop），但 seek 期间绝不能 Stop。"""
+        controller, _ring, record, _streams = self._playing()
+        record.client.calls.clear()
+        controller._handle_flush("999")          # seek
+        controller._handle_pause()               # seek 过程中的暂停事件
+        self.assertNotIn("stop", record.client.calls,
+                         "SEEK 实验：seek 保持窗口内不得向渲染器发送 Stop"
+                         "（会拆掉它正在用的 HTTP 连接）")
+        self.assertNotIn("set_uri", record.client.calls,
+                         "SEEK 实验：seek 保持窗口内不得 SetAVTransportURI")
+
+    def test_seek_hold_ignores_pend(self):
+        controller, _ring, _record, _streams = self._playing()
+        controller._handle_flush("999")
+        controller._handle_play_stream_end("播放流结束")   # pend 迟到
+        self.assertFalse(controller._awaiting_new_stream,
+                         "SEEK 实验：保持窗口内收到 pend 不得进入过渡态（会被误判成播放结束）")
+        self.assertNotEqual(state_mod.STOPPED, controller.state.state)
+        self.assertTrue(controller._in_seek_hold())
+
+    def test_seek_hold_ends_when_pcm_arrives(self):
+        controller, _ring, _record, streams = self._playing()
+        controller._handle_flush("999")
+        self.assertTrue(controller._in_seek_hold())
+        controller.on_audio_bytes(b"\x00" * 4096)          # 新 PCM 到达（音频线程）
+        self.assertTrue(controller._seek_pcm_seen, "音频线程应记录 T6")
+        controller._sample_seek_hold()                      # 轮询线程收尾
+        self.assertFalse(controller._in_seek_hold(), "PCM 到达后应结束保持窗口")
+
+    def test_seek_probe_records_t0_and_t1(self):
+        """打点必须能回答「T6 之后是渲染器先停（T8）还是我们先断（T7）」。"""
+        controller, _ring, _record, _streams = self._playing()
+        controller._handle_flush("999")
+        timeline = controller._seek_timeline
+        self.assertIsNotNone(timeline)
+        controller._handle_pause()
+        controller.on_audio_bytes(b"\x00" * 1024)
+        names = [m[0] for m in timeline.marks]
+        self.assertIn("T0_seek_detected", names)
+        self.assertIn("T1_no_stop_sent", names)
+        self.assertIn("T6_first_real_pcm", names)
+        controller._finish_seek_hold("测试结束")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
