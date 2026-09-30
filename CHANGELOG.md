@@ -5,6 +5,66 @@
 
 ---
 
+## 1.0.29 — 音频幅度计：定位「无声」卡在哪一层
+
+### 1.0.28 的诊断数据推翻了此前所有猜测
+那次真机的诊断行：
+
+```
+22:10:43  airplay_pos=186258 state=BUFFERING renderer=PLAYING rel_time=4000  gen=2 cli=1 real_pcm=6.4s  silence=0.2s
+22:10:59  airplay_pos=202958 state=BUFFERING renderer=PLAYING rel_time=20000 gen=2 cli=1 real_pcm=21.8s silence=0.2s
+```
+
+SEEK 打点报告：
+
+```
+T0_seek_detected  T+0ms
+T6_first_real_pcm T+490ms  (3244 bytes)
+T9_hold_end       T+734ms  PCM 到达
+** T6→T7 HTTP 关闭      = 未发生
+** T6→T8 渲染器 STOPPED  = 未发生
+```
+
+结论：**会话没有被拆、HTTP 连接没有断、渲染器全程 PLAYING、真实 PCM 持续送达
+（21.8 秒）且几乎不需要静音填充（0.2 秒）**。因此下列猜测全部被排除：
+
+| 猜测 | 结论 |
+|---|---|
+| seek 时主动 Stop / 重建会话 | ❌ 已排除（渲染器全程 PLAYING） |
+| 长时间静音填充导致渲染器判废 | ❌ 已排除（silence 仅 0.2s） |
+| AirPlay 在 seek 后不送 PCM | ❌ 已排除（real_pcm 21.8s） |
+| HTTP 连接生命周期被本方拆掉 | ❌ 已排除（T6→T7 未发生） |
+
+### 剩下的唯一解释：送出去的是「数字静音」
+`ring.read()` 返回**非空**并不代表里面有**声音**。如果 AirPlay 送来的是全 0 采样，
+那么 `real_pcm` 会照常增长、渲染器会照常 `PLAYING`、`rel_time` 会照常推进 ——
+**所有指标都正常，而音箱不出声**。这与观测到的每一个现象都吻合。
+
+### 新增测量
+诊断行新增：
+
+```
+pcm_peak=0 pcm_rms=0 zero_chunks=48/48
+```
+
+* `pcm_peak`：本窗口内最大绝对采样值（0..32767）；
+* `pcm_rms`：最近一块的有效值；
+* `zero_chunks/N`：其中「全 0」块的占比。
+
+实现跑在音频线程里，用 `array.array` 的 C 层 `max()/min()`，
+RMS 用 `audioop`（Python 3.12；取不到则只统计峰值），确保不影响音频通路。
+
+### 判读方式
+| 观测 | 结论 |
+|---|---|
+| seek 后 `pcm_peak=0`、`zero_chunks=N/N` | 问题在 **AirPlay 接收侧**（shairport-sync 送来的是静音），不在本项目的 DLNA 层 |
+| `pcm_peak` 正常（数千以上）但仍无声 | 渲染器丢弃了我们的流 ⇒ 下一步做 **WAV vs L16** 独立对照 |
+
+### 验证
+单元测试 **199/199** 通过（新增 3 项 `PcmMeterTests`，覆盖全 0 检测、有声峰值、窗口重置）。
+
+---
+
 ## 1.0.28 — 找到音频接线 bug；SEEK 实验得出结论
 
 ### 结果一：发现一处真实的接线 bug（很可能是长期修不好的元凶之一）

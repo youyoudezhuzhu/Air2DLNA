@@ -35,6 +35,13 @@
 
 from __future__ import annotations
 
+import array
+
+try:  # audioop 在 3.13 被移除；取不到时幅度计只统计峰值
+    import audioop  # type: ignore[import-not-found]
+except Exception:  # noqa: BLE001
+    audioop = None  # type: ignore[assignment]
+
 import logging
 import threading
 import time
@@ -399,6 +406,13 @@ class VirtualPlayer:
         self._seek_seen_renderer_stopped = False
         #: 音频线程观察到 seek 后首个真实 PCM（由轮询线程消费）
         self._seek_pcm_seen = False
+        #: 音频幅度计（诊断）：区分「真的在送音频」与「送的是数字静音」。
+        #: ring.read() 返回非空**不代表**里面有声音 —— 如果 AirPlay 送来的是全 0
+        #: 采样，real_pcm 会照常增长、渲染器照常 PLAYING，但音箱就是不出声。
+        self._pcm_peak = 0            # 本统计窗口内的最大绝对采样值（0..32767）
+        self._pcm_rms = 0.0           # 最近一块的 RMS
+        self._pcm_chunks = 0          # 本窗口块数
+        self._pcm_zero_chunks = 0     # 其中「全 0」块数
         #: 暂停状态下累计收到的 PCM 字节数（用于「AirPlay 已恢复但没有事件」的兜底）
         self._paused_audio_bytes = 0
         #: keepalive 期间连续没有客户端的采样次数（用于判定断流）
@@ -643,6 +657,7 @@ class VirtualPlayer:
     def on_audio_bytes(self, data: bytes) -> None:
         """音频读取线程回调：把 FIFO 数据推进环形缓冲。"""
         self.ring.append(data)
+        self._meter_pcm(data)
         # ★ SEEK 实验 T6：seek 之后第一个真实 PCM 字节。
         # 这里**只打点、不做任何网络操作**（音频线程纪律），实际结束保持窗口交给轮询线程。
         if self._seek_timeline is not None and len(data) > 0:
@@ -659,6 +674,44 @@ class VirtualPlayer:
         if self._awaiting_new_stream:
             # 仍有 PCM 进来 → 播放流并未真正结束（只是事件次序），立刻退出过渡态
             self._cancel_transition("仍在推送 PCM")
+
+    # ------------------------------------------------------------ 音频幅度计
+    def _meter_pcm(self, data: bytes) -> None:
+        """统计本块 PCM 的峰值（诊断用，必须廉价：跑在音频线程里）。
+
+        ``max()/min()`` 对 ``array.array`` 是 C 层实现，足以实时处理 44.1kHz 立体声。
+        RMS 用 ``audioop``（Python 3.12 可用）；取不到就退化为只统计峰值。
+        """
+        n = len(data) - (len(data) % 2)
+        if n <= 0:
+            return
+        try:
+            samples = array.array("h")
+            samples.frombytes(data[:n])
+            peak = max(max(samples), -min(samples))
+        except Exception:  # noqa: BLE001 - 幅度计绝不影响音频通路
+            return
+        self._pcm_peak = max(self._pcm_peak, peak)
+        self._pcm_chunks += 1
+        if peak == 0:
+            self._pcm_zero_chunks += 1
+        try:
+            self._pcm_rms = audioop.rms(data[:n], 2)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def pcm_meter(self) -> dict:
+        """取走并重置本统计窗口的幅度数据（供诊断行使用）。"""
+        data = {
+            "peak": self._pcm_peak,
+            "rms": self._pcm_rms,
+            "chunks": self._pcm_chunks,
+            "zero_chunks": self._pcm_zero_chunks,
+        }
+        self._pcm_peak = 0
+        self._pcm_chunks = 0
+        self._pcm_zero_chunks = 0
+        return data
 
     # ------------------------------------------------- AudioPipeReader 的 sink 协议
     def append(self, data: bytes) -> None:
@@ -1949,10 +2002,12 @@ class VirtualPlayer:
             state_name = self.state.state
             renderer_state = self.state.renderer_state
             machine = self.machine_state
+        _meter = self.pcm_meter()
         log.info(
             "诊断: airplay_pos=%s state=%s machine=%s renderer=%s rel_time=%s offset=%s rate=%s "
             "gen=%s token=%s http_clients=%s bytes_served=%s last_range=%s "
-            "real_pcm=%.1fs silence=%.1fs idle=%.1fs uri_count=%d last_rebuild=%s "
+            "real_pcm=%.1fs silence=%.1fs pcm_peak=%d pcm_rms=%d zero_chunks=%d/%d "
+            "idle=%.1fs uri_count=%d last_rebuild=%s "
             "awaiting_new_stream=%s pause_recovery=%s "
             "keepalive_capable=%s tl_playing=%s pending=%s",
             int(self.timeline.position_ms()) if self.timeline.position_ms() is not None else "-",
@@ -1970,6 +2025,7 @@ class VirtualPlayer:
              if session is not None else 0.0),
             (getattr(session, "silence_bytes", 0) / float(self.ring.byte_rate)
              if session is not None else 0.0),
+            _meter["peak"], int(_meter["rms"]), _meter["zero_chunks"], _meter["chunks"],
             (now - session.last_activity) if session is not None and session.last_activity else -1.0,
             self.output.uri_count, self._last_rebuild_reason or "-", self._awaiting_new_stream,
             ("active" if self._pause_recovery_deadline > 0.0

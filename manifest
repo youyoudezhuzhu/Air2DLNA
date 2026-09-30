@@ -1,5 +1,5 @@
 appname                    = air2dlna
-version                    = 1.0.28
+version                    = 1.0.29
 display_name               = Air2DLNA
 desc                       = Air2DLNA：把任意 DLNA/UPnP 音响变成 AirPlay 2 音箱。应用原生运行在飞牛 NAS 上（不使用 Docker），内置 AirPlay 2 接收器，把 Apple 设备推来的音频实时转成 PCM 流经 HTTP 推送到局域网 DLNA MediaRenderer，并提供 Web UI 管理 AirPlay 名称、DLNA 设备选择、播放状态与日志。
 platform                   = x86
@@ -16,4 +16,4 @@ service_port               = 8788
 checkport                  = true
 ctl_stop                   = true
 disable_authorization_path = true
-changelog                  = 1.0.28 两个重要结果。① **发现并修复一处接线 bug（很可能是「拖进度条后无声」的真正元凶之一）**：bridge.py 把 AudioPipeReader 的 sink 直接绑成了裸 ring（AudioPipeReader(self.audio_fifo, self._ring)），而 VirtualPlayer.on_audio_bytes **在整个代码库里只有定义、没有任何生产调用点**（只有测试调用过）——同处的元数据读取器却是正确绑到 controller 的，足以说明这是遗漏。它导致两条兜底在生产环境**从未执行**：(a) 暂停期间持续收到 PCM ⇒ 判定 AirPlay 其实已恢复（真机实测拖动进度条时 AirPlay 可能**完全不发** pbeg/pres/pfls 任何事件，只靠事件永远醒不过来）；(b) 仍在推送 PCM ⇒ 不把 pend 当成播放流真正结束。现改为 AudioPipeReader(self.audio_fifo, self._controller)，并给 VirtualPlayer/BridgeController 补齐 append()/byte_rate（读取器的 sink 协议）。② **SEEK 实验（1.0.27）已得到明确结论**：保持会话期间渲染器**从未转入 STOPPED**，全程 renderer=PLAYING、拉流连接=1，位置 rel_time 从 12s 正常推进到 23s ——证实「seek 时主动 Stop/重建」确实是问题，且保持会话的方向正确（此前每次都会 STOPPED）。但仍有听不到声音的情况，因此新增决定性诊断：在诊断行输出 **real_pcm / silence 秒数对比**（分别统计真实 PCM 字节与静音填充字节），直接回答「音箱一直在拉流时我们喂的到底是音频还是静音」。另修正 SEEK 打点的 T6（此前因上述接线 bug 永远打不上）。单元测试 196/196 通过（新增 4 项 AudioIngestWiringTests，专门锁定音频必须经 VirtualPlayer 进入环形缓冲）。<br/>
+changelog                  = 1.0.29 新增**音频幅度计**，用于判定「拖进度条后无声」到底卡在哪一层 —— 这是 1.0.28 诊断数据得出的关键结论：该次真机里 renderer=PLAYING、拉流连接=1、**real_pcm 从 6.4s 增长到 21.8s 而 silence 只有 0.2s**、渲染器 rel_time 从 4s 正常推进到 20s —— 也就是说「会话没被拆、连接没断、真实 PCM 也在持续送达」，与会话生命周期、静音填充、AirPlay 不给 PCM 这三种猜测**全部不符**。剩下的唯一解释是：**ring.read() 返回的非空数据其实是数字静音（全 0 采样）** —— 这样所有指标都正常，而音箱不出声。因此诊断行新增 pcm_peak（最大绝对采样值 0..32767）、pcm_rms、zero_chunks/N（全 0 块占比），直接测量送出去的 PCM 有没有声音。判读：若 seek 后 pcm_peak=0 且 zero_chunks=N/N，说明问题在 AirPlay 接收侧（shairport-sync 送来的是静音）而非本项目的 DLNA 层；若 pcm_peak 正常而仍无声，则是渲染器丢弃了我们的流，下一步做 WAV vs L16 对照。幅度计跑在音频线程里，用 array.array 的 C 层 max/min 实现（RMS 用 audioop，取不到则只统计峰值），确保不影响音频通路。单元测试 199/199 通过（新增 3 项 PcmMeterTests）。<br/>

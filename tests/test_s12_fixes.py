@@ -438,5 +438,41 @@ class AudioIngestWiringTests(unittest.TestCase):
                          "仍有 PCM 时必须取消 pend 过渡（该兜底此前从未执行）")
 
 
+# --------------------------------------------------------------- 音频幅度计
+class PcmMeterTests(unittest.TestCase):
+    """幅度计：区分「真的在送音频」与「送的是数字静音」。
+
+    真机现象（1.0.28）：renderer=PLAYING、拉流连接=1、real_pcm 从 6.4s 涨到 21.8s、
+    silence 仅 0.2s —— 一切指标都正常，但用户听不到声音。
+    `ring.read()` 返回**非空**并不代表里面有**声音**：若 AirPlay 送来的是全 0 采样，
+    这些指标会完全正常而音箱不出声。因此必须直接测幅度。
+    """
+
+    def test_silent_chunks_are_detected(self):
+        controller, _c, _ring, _t, _r, _s = build_controller(model="S12")
+        controller.on_audio_bytes(b"\x00" * 8192)          # 数字静音
+        meter = controller._player.pcm_meter()
+        self.assertEqual(meter["peak"], 0, "全 0 采样峰值必须为 0")
+        self.assertEqual(meter["zero_chunks"], 1)
+        self.assertEqual(meter["chunks"], 1)
+
+    def test_loud_chunks_report_peak(self):
+        import struct
+        controller, _c, _ring, _t, _r, _s = build_controller(model="S12")
+        loud = struct.pack("<2000h", *([12000, -12000] * 1000))
+        controller.on_audio_bytes(loud)
+        meter = controller._player.pcm_meter()
+        self.assertEqual(meter["peak"], 12000)
+        self.assertEqual(meter["zero_chunks"], 0)
+
+    def test_meter_resets_between_windows(self):
+        controller, _c, _ring, _t, _r, _s = build_controller(model="S12")
+        controller.on_audio_bytes(b"\x00" * 4096)
+        first = controller._player.pcm_meter()
+        second = controller._player.pcm_meter()
+        self.assertEqual(first["chunks"], 1)
+        self.assertEqual(second["chunks"], 0, "取走后必须重置，保证每行只覆盖本窗口")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
