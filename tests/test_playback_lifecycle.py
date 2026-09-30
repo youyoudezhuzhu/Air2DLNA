@@ -60,11 +60,17 @@ class _StubClient:
 class _Record:
     def __init__(self, client=None) -> None:
         self.udn = "uuid:fake"
-        self.name = "小爱音箱-测试"
+        self.name = "通用渲染器-测试"
         self.ip = "192.168.1.60"
         self.client = client
-        self.model = "S12"
-        self.manufacturer = "Mi, Inc."
+        # 本文件测的是 keepalive 的**机制**（健康检查、暂停不动渲染器、恢复不发 UPnP），
+        # 因此必须用一个 Profile 允许 keepalive 的设备。
+        # 真机证据表明小爱 S12 的暂停实为 Stop 且会丢弃 HTTP（renderer=STOPPED 3724 次
+        # vs PAUSED_PLAYBACK 2 次），其 Profile 声明 supports_pause=False，
+        # keepalive 会因此被否决（见 tests/test_s12_fixes.py 的专门用例）。
+        # 这里原先照抄了 model="S12"，会让机制测试跑到不适用的设备上。
+        self.model = ""
+        self.manufacturer = ""
         self.online = True
         self.supported_mime = "http-get:*:audio/wav:*"
         self.capability_error = ""

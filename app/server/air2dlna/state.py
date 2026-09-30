@@ -128,7 +128,7 @@ class BridgeController:
             lock=self._lock, stop_event=self._stop_event, state=self.state, log=log,
         )
         #: Renderer Profile 缓存：(udn, profile)
-        self._profile_cache: tuple[str, Optional[RendererProfile]] = ("", None)
+        self._profile_cache: tuple[object, Optional[RendererProfile]] = ("", None)
 
     # ------------------------------------------------- 属性转发（历史调用方兼容）
     def __getattr__(self, name: str):
@@ -183,11 +183,22 @@ class BridgeController:
         if record is None:
             return select_profile(None, override=override, config=self.config)
         udn = getattr(record, "udn", "") or ""
+        # 缓存键必须包含**完整身份**，不能只用 UDN。
+        # 真机证据（1.0.23）：SSDP 阶段只有名字、``model`` 还是空串，此时会选中
+        # generic 并写进缓存；``model='S12'`` 要等设备描述 XML 抓回来才知道。
+        # 旧实现只比 UDN，于是 generic 被缓存**整个进程生命周期**，
+        # 日志实证：``name='小爱音箱-2284' model='' -> generic`` 之后再无重算，
+        # 导致 xiaomi_s12 Profile（以及它的暂停语义）永远不会生效。
+        cache_key = (udn,
+                     getattr(record, "model", "") or "",
+                     getattr(record, "name", "") or "",
+                     getattr(record, "manufacturer", "") or "",
+                     override)
         cached = self._profile_cache
-        if cached[0] == udn and cached[1] is not None:
+        if cached[0] == cache_key and cached[1] is not None:
             return cached[1]
         profile = select_profile(record, override=override, config=self.config)
-        self._profile_cache = (udn, profile)
+        self._profile_cache = (cache_key, profile)
         if cached[1] is None or cached[1].name != profile.name:
             log.info("Renderer Profile 选择: udn=%s name=%r model=%r -> %s",
                      udn or "-", getattr(record, "name", ""),

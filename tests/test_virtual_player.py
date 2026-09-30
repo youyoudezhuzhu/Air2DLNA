@@ -177,6 +177,10 @@ class _Streams:
     def get(self, token):  # noqa: D102
         return self._sessions.get(token)
 
+    @property
+    def current(self):  # noqa: D102 - 与真实 StreamManager.current 保持一致
+        return self._sessions.get(self.created[-1]) if self.created else None
+
     def update_duration(self, duration_ms):  # noqa: D102
         return None
 

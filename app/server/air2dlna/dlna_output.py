@@ -30,7 +30,7 @@ from typing import Any, Callable, Optional
 
 from . import netif, stream, upnp
 from .renderer_profile import GENERIC_PROFILE, RendererProfile
-from .ringbuffer import PcmRingBuffer
+from .ringbuffer import PcmRingBuffer, StaleGeneration
 from .timeline import AudioTimeline
 
 log = logging.getLogger("dlna_output")
@@ -424,7 +424,22 @@ class DLNAOutput:
         plan = self.buffer_plan(record)
         needed = int(plan["target_seconds"] * self.ring.byte_rate)
         generation = session.generation
-        if not self.ring.wait_for_data(0, generation, needed, timeout=8.0):
+        try:
+            ready = self.ring.wait_for_data(0, generation, needed, timeout=8.0)
+        except StaleGeneration:
+            # 预滚动等待期间缓冲又换代了（seek 会连续产生多代）。**绝不能让它抛出
+            # converge**：那会中断整轮收敛，SetAVTransportURI/Play 都发不出去，
+            # 渲染器拿不到新 URI —— 真机表现就是「拖进度条后完全没有声音」。
+            # 正确做法是把意图重新指向最新一代，让收敛线程再跑一轮。
+            newest = getattr(self.streams, "current", None)
+            log.warning(
+                "预滚动期间缓冲换代（gen=%s → %s）：改用最新一代重新收敛，"
+                "避免中断 SetURI/Play",
+                generation, getattr(newest, "generation", "?"))
+            if newest is not None and newest.token != token:
+                self.set_intent(MODE_PLAY, newest.token, set_uri=True, play=True)
+            return
+        if not ready:
             try:
                 available = self.ring.write_offset
             except Exception:  # noqa: BLE001

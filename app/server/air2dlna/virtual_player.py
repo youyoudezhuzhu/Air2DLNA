@@ -347,6 +347,8 @@ class VirtualPlayer:
         self._recovery_started_at = 0.0
         #: Renderer Profile（按 UDN）：记录该设备是否能可靠保持 keepalive。
         self._keepalive_capable: dict[str, bool] = {}
+        #: 是否已就「Profile 声明不支持暂停 → keepalive 不适用」记录过一次日志
+        self._keepalive_profile_warned = False
         #: 暂停状态下累计收到的 PCM 字节数（用于「AirPlay 已恢复但没有事件」的兜底）
         self._paused_audio_bytes = 0
         #: keepalive 期间连续没有客户端的采样次数（用于判定断流）
@@ -899,6 +901,26 @@ class VirtualPlayer:
 
     def _keepalive_allowed(self) -> bool:
         """该渲染器是否还有资格尝试 keepalive（Renderer Profile）。"""
+        # Profile 层面的一票否决。keepalive 的前提是「渲染器能停住且不丢弃会话」，
+        # 而它的策略是**不对渲染器发任何 UPnP 命令**、只在输出层改送静音。
+        # 真机证据（小爱音箱 S12）：它收到 Pause 会自行进入 STOPPED 并丢弃 HTTP 拉流
+        # （真机日志 renderer=STOPPED 3724 次 vs PAUSED_PLAYBACK 2 次）。后果是：
+        #   * 暂停：音箱先把已缓冲的真实 PCM 放完（约 5~6s）才轮到我们送的静音；
+        #   * 恢复：音箱又要把缓冲里的静音放完（约 5~6s）才听到真实声音。
+        # 这正是用户反馈的「暂停/恢复各延迟 5~6 秒」。对这种设备 keepalive 从原理上
+        # 不成立，必须走 current（真实 Pause/Stop + 恢复时重新宣告）。
+        try:
+            profile = self.output.profile()
+        except Exception:  # noqa: BLE001 - Profile 取不到时不得影响暂停流程
+            profile = None
+        if profile is not None and not profile.supports_pause:
+            if not self._keepalive_profile_warned:
+                self._keepalive_profile_warned = True
+                log.info(
+                    "keepalive 不适用：Renderer Profile(%s) 声明 supports_pause=False"
+                    "（该设备的暂停实为 Stop 且丢弃 HTTP），暂停/恢复改用 current 方案，"
+                    "避免 5~6 秒缓冲延迟", profile.name)
+            return False
         return self._keepalive_capable.get(self._keepalive_udn(), True) is not False
 
     def _mark_keepalive_unsupported(self, reason: str) -> None:

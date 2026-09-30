@@ -5,6 +5,80 @@
 
 ---
 
+## 1.0.24 — 修复真机反馈：暂停/恢复延迟与拖进度条后无声
+
+真机（小爱音箱 S12 + iPhone AirPlay 2）反馈两个问题：**暂停/恢复各有 5~6 秒延迟**、
+**拖动进度条后完全没有声音**。共定位并修复四处缺陷，全部有真机日志或代码证据。
+
+### ① 换代后旧 token 只拿到 0 字节（无声的主因）
+`new_generation()` 会把旧会话标记 `closed`，而 HTTP 服务见到 `closed` 就断开连接。
+但渲染器往往**仍在拉这个旧 URL** —— 音箱不会因为我们换了 URI 就立刻放弃旧连接。
+真机日志（gen=3 已开始后）：
+
+```
+渲染器开始拉流: token=1790760602-2 gen=2 range_start=10138872 (第 2 次连接)
+渲染器拉流结束: token=1790760602-2 本次连接 0.0s
+渲染器开始拉流: token=1790760602-2 gen=2 range_start=44 (第 3 次连接)
+```
+
+`本次连接 0.0s` 就是 0 字节。现在把 `closed` 分成两种含义：
+
+* **被换代取代** —— 跟随最新一代继续输出（实时流没有「旧版本」可言）；
+* **被主动关闭**（Stop / close_all）—— 正常结束连接。
+
+同时修掉一个时序陷阱：`ring.flush()` 先发生，连接可能已跟随到新代，之后
+`new_generation()` 才置上 `closed`，此时 `session.generation == ring.generation`，
+只比较 generation 会漏判 —— 改用「是否仍是 current 会话」判定。
+
+### ② 预滚动期间换代中断整轮收敛（无声的直接原因）
+`do_play()` 等待预滚动时，`ring.wait_for_data()` 抛出的 `StaleGeneration` 没有被捕获，
+异常冲出 `converge`，导致 `SetAVTransportURI` / `Play` **根本没有发出去**。
+seek 会连续产生多代（`pdis` 一代 + `pbeg`/`prsm` 一代），所以几乎必然触发。
+真机日志原文：
+
+```
+ERROR [dlna_output] DLNA 收敛过程异常
+  ...
+  File "dlna_output.py", line 427, in do_play
+    if not self.ring.wait_for_data(0, generation, needed, timeout=8.0):
+air2dlna.ringbuffer.StaleGeneration: 等待预滚动期间缓冲换代
+```
+
+现在捕获该异常并把意图重新指向最新一代，让收敛线程再跑一轮。
+
+### ③ Renderer Profile 选择结果被按 UDN 永久缓存（延迟的主因）
+真机日志：
+
+```
+Renderer Profile 选择: udn=uuid:64f2215e-... name='小爱音箱-2284' model='' -> generic
+```
+
+SSDP 阶段只有名字、`model` 还是空串，而 `model='S12'` 要等设备描述 XML 抓回来才知道。
+旧缓存键只有 UDN，于是 **generic 被缓存整个进程生命周期**，`xiaomi_s12` Profile
+（以及它的暂停语义）永远不生效 —— 这也是升级到 1.0.23 后体感没有改善的原因。
+现在缓存键包含 `model`/`name`/`manufacturer`/`override`，身份变好立即失效重算。
+
+### ④ 对「暂停实为 Stop」的设备仍启用 keepalive（延迟的直接原因）
+keepalive 的策略是**不对渲染器发任何 UPnP 命令**、只在输出层改送静音。对小爱 S12
+（真机日志 `renderer=STOPPED` 3724 次 vs `PAUSED_PLAYBACK` 2 次，暂停即 Stop 并丢弃 HTTP）：
+音箱要先把已缓冲的真实 PCM 放完（约 5~6 秒）暂停才生效，恢复时又要把缓冲里的静音
+放完（约 5~6 秒）才听到声音 —— 正是「暂停/恢复各延迟 5~6 秒」。
+现在 `RendererProfile.supports_pause is False` 时**一票否决 keepalive**，自动改用
+`current`（真实 Pause/Stop + 恢复时重新宣告）。
+
+### 验证
+* 单元测试 **182/182** 通过（1.0.23 为 174，新增 8 项 `tests/test_s12_fixes.py`）。
+* 端到端集成测试 **42/42** 通过。
+* `tests/test_playback_lifecycle.py` 的 keepalive **机制**测试改用允许 keepalive 的
+  通用设备（原先照抄了 `model="S12"`，会让机制测试跑到不适用的设备上；原因已写在
+  测试注释里）。S12 的 keepalive 否决有专门用例覆盖。
+
+### 待真机复验
+暂停/恢复的实际时延、拖进度条的出声与位置正确性、以及 `silence_timeout_seconds`（默认 8s）
+是否合适。
+
+---
+
 ## 1.0.23 — Virtual Player 架构重构
 
 把原来「AirPlay 事件 → 直接映射 DLNA 动作」的实现，重构为

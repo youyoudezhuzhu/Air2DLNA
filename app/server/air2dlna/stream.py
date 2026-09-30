@@ -373,6 +373,17 @@ class StreamManager:
         # 叠加推过 total_bytes，之后所有连接都会立刻 break 并只补静音 —— 表现为
         # 「暂停/拖进度条后音响没声音」。session.bytes_served 仅保留作累计诊断。
         sent_conn = 0
+        # 渲染器在换代之后仍可能来拉旧 token（见下方 closed 分支的说明）。
+        # 入口处先重锚一次，保证「一进来就有声音」而不是 0 字节。
+        if (session.continuous_output
+                and (session.generation != self.ring.generation
+                     or (self._current is not None and self._current is not session))):
+            log.info(
+                "请求的 token 已被换代取代（token=%s gen=%s → 当前 %s）："
+                "按实时流语义改为输出最新一代，避免 0 字节断流",
+                session.token, session.generation, self.ring.generation)
+            session.generation = self.ring.generation
+            session.closed = False
         try:
             offset = mapped_offset if mapped_offset is not None else 0
             if session.kind == "wav" and not head_only:
@@ -392,6 +403,30 @@ class StreamManager:
             read_timeout = (session.read_timeout_s if session.continuous_output else 1.0)
             while True:
                 if session.closed:
+                    # ``closed`` 有两种来源，必须区分（真机 bug 就出在没区分）：
+                    #   (a) **被换代取代** —— new_generation() 会顺手把旧会话标记 closed，
+                    #       但渲染器往往仍在拉这个旧 URL（音箱不会因为我们换了 URI 就
+                    #       立刻放弃旧连接）。此时直接 break 会让它拿到 0 字节。
+                    #       真机日志实证：token=...-2 在 gen=3 已开始后仍发了
+                    #       range_start=10138872 / 44 两次请求，结果 `本次连接 0.0s`。
+                    #   (b) **被主动关闭**（Stop / close_all）—— 此时 ``_current`` 要么是
+                    #       它自己、要么为空，应当正常结束连接。
+                    # 注意还有一个时序陷阱：ring.flush() 先发生，连接可能已经跟随到新代，
+                    # 之后 new_generation() 才把 closed 置上 —— 此时
+                    # ``session.generation == ring.generation``，只比 generation 会漏判，
+                    # 必须用「是否仍是 current」来判定。
+                    superseded = (self._current is not None and self._current is not session)
+                    if session.continuous_output and superseded:
+                        newest = self._current.generation
+                        log.info(
+                            "旧会话已被换代取代但渲染器仍在拉取：跟随最新一代继续输出"
+                            "（token=%s gen=%s → %s）",
+                            session.token, session.generation, newest)
+                        session.closed = False
+                        session.generation = newest
+                        offset = 0
+                        silence_since = None
+                        continue
                     break
                 # 暂停 keepalive：输出层生成静音（不读环形缓冲、不污染 AirPlay 时间线）。
                 # 渲染器因此一直有数据可拉、保持 PLAYING，恢复时无需任何 UPnP 操作。
@@ -424,6 +459,19 @@ class StreamManager:
                     data, offset = self.ring.read(offset, session.generation, chunk_size,
                                                   read_timeout)
                 except StaleGeneration:
+                    if session.continuous_output:
+                        # 实时流语义：渲染器要的是「现在的声音」，不是某一份历史。
+                        # seek 会连续产生多代（pdis 一代 + pbeg/prsm 一代），旧代立刻失效；
+                        # 早期实现直接 break 会让渲染器的 Range 重连拿到 **0 字节**，
+                        # 真机表现为「拖完进度条完全没声音」。这里改为跟随最新一代继续输出。
+                        newest = self.ring.generation
+                        log.info(
+                            "流已换届：按实时流语义跟随最新一代（token=%s gen=%s→%s），继续输出不断流",
+                            session.token, session.generation, newest)
+                        session.generation = newest
+                        offset = 0
+                        silence_since = None
+                        continue
                     log.info("流已换届，主动断开旧连接: token=%s", session.token)
                     break
                 except BufferOverflow:
