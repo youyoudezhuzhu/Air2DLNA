@@ -318,10 +318,24 @@ class StreamManager:
                 session.on_connect()
             except Exception:  # noqa: BLE001 - 诊断回调不得影响推流
                 pass
+        # 实时流没有可寻址的历史。渲染器经常用 Range 做「这个资源能不能拖」的探测
+        # （真机日志里可见 bytes=0-、bytes=44-、bytes=1030600- 反复出现）。历史实现把
+        # **文件字节偏移**直接当成**环形缓冲偏移**：
+        #   * bytes=44-（跳过 WAV 头）会从 PCM 第 44 字节开始发，错位 11 帧；
+        #   * bytes=1030600-（超过已产生的数据）会在 ring.read 上反复阻塞，
+        #     而 HTTP 层已经声明了 200 + 完整 Content-Length，body 与声明不符，
+        #     渲染器只能重试 → 就是真机日志里那种每几秒一次的重连抖动。
+        # 因此这里**不再把 Range 当作定位依据**：一律从当前逻辑起点线性发送。
+        # 这与 HTTP 层「200 + 完整长度 + Accept-Ranges: none」的声明保持一致，
+        # 也是 AirConnect 在真实设备上验证过的做法。
+        if range_start:
+            log.info(
+                "忽略 Range 偏移（实时流不可寻址，改从当前起点线性发送）: "
+                "token=%s range_start=%s", session.token, range_start)
+
         # 暂停恢复（方案 A）：只在「逻辑 0 点」上做映射，且必须由控制器显式开启。
-        # 正常的 Range 请求（含正常播放期间的重连）行为完全不变。
         mapped_offset: Optional[int] = None
-        if range_start == 0 and session.recovery_byte_offset is not None:
+        if session.recovery_byte_offset is not None:
             mapped_offset = session.recovery_byte_offset
             session.recovery_applied = True
             seconds = mapped_offset / float(session.byte_rate or 1)
@@ -329,9 +343,15 @@ class StreamManager:
                 "暂停恢复映射生效: token=%s gen=%d 逻辑 Range 0 -> 实际环形偏移 %d 字节 (%.1fs)",
                 session.token, session.generation, mapped_offset, seconds,
             )
+        # 本连接已写出的 PCM 字节数。
+        # **必须按连接独立计数**：历史实现用会话级 session.bytes_served 做流控，
+        # 同一个 token 被多次 GET/重连（真机日志里一次恢复就有 5+ 次连接）后计数被
+        # 叠加推过 total_bytes，之后所有连接都会立刻 break 并只补静音 —— 表现为
+        # 「暂停/拖进度条后音响没声音」。session.bytes_served 仅保留作累计诊断。
+        sent_conn = 0
         try:
-            offset = mapped_offset if mapped_offset is not None else range_start
-            if session.kind == "wav" and range_start == 0 and not head_only:
+            offset = mapped_offset if mapped_offset is not None else 0
+            if session.kind == "wav" and not head_only:
                 wfile.write(build_wav_header(session.total_bytes, session.sample_rate,
                                              session.channels, session.bits))
                 wfile.flush()
@@ -347,7 +367,7 @@ class StreamManager:
                 # 渲染器因此一直有数据可拉、保持 PLAYING，恢复时无需任何 UPnP 操作。
                 if session.silence_mode:
                     if (session.total_bytes is not None
-                            and session.bytes_served >= session.total_bytes):
+                            and sent_conn >= session.total_bytes):
                         break
                     silence = b"\x00" * chunk_size
                     wfile.write(silence)
@@ -355,6 +375,7 @@ class StreamManager:
                         wfile.flush()
                     except Exception:  # noqa: BLE001
                         break
+                    sent_conn += len(silence)
                     session.bytes_served += len(silence)
                     session.last_activity = time.monotonic()
                     if session.on_bytes is not None:
@@ -365,10 +386,7 @@ class StreamManager:
                     # 按实时速率节流（44.1k/16bit/2ch 时 32KB ≈ 0.19s）
                     time.sleep(chunk_size / float(session.byte_rate or 176400))
                     continue
-                # 注意：有暂停恢复映射时不要把 offset 重置回 0（否则又会从本代起点播）
-                if mapped_offset is None and range_start == 0 and session.bytes_served == 0:
-                    offset = 0
-                if session.total_bytes is not None and session.bytes_served >= session.total_bytes:
+                if session.total_bytes is not None and sent_conn >= session.total_bytes:
                     break
                 try:
                     data, offset = self.ring.read(offset, session.generation, chunk_size, 1.0)
@@ -386,10 +404,11 @@ class StreamManager:
                     continue
                 last_progress = time.monotonic()
                 if session.total_bytes is not None:
-                    remaining = session.total_bytes - session.bytes_served
+                    remaining = session.total_bytes - sent_conn
                     if len(data) > remaining:
                         data = data[:remaining]
                 wfile.write(data)
+                sent_conn += len(data)
                 session.bytes_served += len(data)
                 session.last_activity = time.monotonic()
                 if session.on_bytes is not None:
@@ -398,11 +417,11 @@ class StreamManager:
                     except Exception:  # noqa: BLE001 - 诊断回调不得影响推流
                         pass
 
-            # 声明了总长度但实际数据不足：补静音，避免渲染器等到超时
+            # 声明了总长度但本连接发送不足：补静音，避免渲染器等到超时
             if (session.total_bytes is not None
-                    and session.bytes_served < session.total_bytes
+                    and sent_conn < session.total_bytes
                     and not session.closed):
-                _pad_silence(wfile, session.total_bytes - session.bytes_served)
+                _pad_silence(wfile, session.total_bytes - sent_conn)
             try:
                 wfile.flush()
             except Exception:  # noqa: BLE001
@@ -420,8 +439,11 @@ class StreamManager:
                 except Exception:  # noqa: BLE001
                     pass
             log.info(
-                "渲染器拉流结束: token=%s 已发送 %.1fs 音频",
-                session.token, session.bytes_served / float(session.byte_rate or 1),
+                "渲染器拉流结束: token=%s 本次连接 %.1fs（本 token 累计 %.1fs，共 %d 次连接）",
+                session.token,
+                sent_conn / float(session.byte_rate or 1),
+                session.bytes_served / float(session.byte_rate or 1),
+                session.range_requests,
             )
 
 
