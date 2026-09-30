@@ -201,6 +201,9 @@ class StreamSession:
     on_silence_timeout: Optional[Callable[[], None]] = None
     #: 已经通过连续输出发送的静音字节（诊断用；与 ``bytes_served`` 分开统计）。
     silence_bytes: int = 0
+    #: 本会话真正来自 AirPlay 的 PCM 字节数（与 silence_bytes 分开统计）。
+    #: 用于回答一个关键问题：音箱一直在拉流时，我们喂给它的到底是**音频**还是**静音**。
+    pcm_bytes: int = 0
     #: 连续输出下等待真实 PCM 的单次读取超时（秒）。越小，真实 PCM 断流后
     #: 越快地切换为静音（暂停/seek/切歌后的空窗因此不会变成 EOF）。
     read_timeout_s: float = 0.2
@@ -546,6 +549,7 @@ class StreamManager:
                 wfile.write(data)
                 sent_conn += len(data)
                 session.bytes_served += len(data)
+                session.pcm_bytes += len(data)
                 session.last_activity = time.monotonic()
                 if session.on_bytes is not None:
                     try:

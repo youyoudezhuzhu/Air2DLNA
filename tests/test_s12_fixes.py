@@ -386,5 +386,57 @@ class SeekHoldExperimentTests(unittest.TestCase):
         controller._finish_seek_hold("测试结束")
 
 
+# --------------------------------------------------------------- 音频入口接线
+class AudioIngestWiringTests(unittest.TestCase):
+    """回归：音频必须**经 VirtualPlayer** 进入环形缓冲。
+
+    真机 bug：``bridge.py`` 把 ``AudioPipeReader`` 的 sink 直接绑成裸 ring
+    （``AudioPipeReader(self.audio_fifo, self._ring)``），而 ``VirtualPlayer.on_audio_bytes``
+    在整个代码库里**只有定义、没有任何调用点**（只有测试调用过）。于是它承载的两条兜底
+    在生产环境**从未执行**，而这正是「拖进度条后无声」长期修不好的原因之一：
+
+    * 暂停期间持续收到 PCM ⇒ 判定 AirPlay 其实已恢复
+      （真机实测拖动进度条时 AirPlay 可能**完全不发** pbeg/pres/pfls 任何事件，
+       只靠事件永远醒不过来）；
+    * 仍在推送 PCM ⇒ 不把 ``pend`` 当成播放流真正结束。
+
+    对照：同一处的元数据读取器是**正确**绑到 controller 的
+    （``MetadataPipeReader(self.metadata_fifo, self._controller.on_metadata_item)``），
+    足以说明音频这处是遗漏而非设计。
+    """
+
+    def test_reader_sink_protocol_reaches_ring(self):
+        """AudioPipeReader 调用的是 sink.append(chunk)。"""
+        controller, _c, ring, _t, _r, _s = build_controller(model="S12")
+        before = ring.write_offset
+        controller.append(b"\x01" * 1024)
+        self.assertEqual(ring.write_offset, before + 1024, "数据应进入环形缓冲")
+
+    def test_reader_sink_byte_rate_exposed(self):
+        controller, _c, _ring, _t, _r, _s = build_controller(model="S12")
+        self.assertEqual(controller.byte_rate, 176400,
+                         "读取器需要 sink.byte_rate 做丢弃统计")
+
+    def test_paused_audio_fallback_runs_through_controller(self):
+        """核心：暂停期间送进来的 PCM 必须被 VirtualPlayer 计数。"""
+        controller, _c, _ring, _t, _r, _s = build_controller(model="S12")
+        controller.state.state = state_mod.PAUSED
+        controller.append(b"\x00" * 4096)
+        self.assertGreater(
+            controller._player._paused_audio_bytes, 0,
+            "经 controller 送出的 PCM 必须触发 VirtualPlayer 的暂停恢复兜底；"
+            "若为 0 说明音频又绕过了 VirtualPlayer（sink 直接绑 ring）")
+
+    def test_pcm_during_pend_transition_cancels_it(self):
+        """pend 过渡态中仍有 PCM ⇒ 说明流并未真正结束，应取消过渡。"""
+        controller, _c, _ring, _t, _r, _s = build_controller(model="S12")
+        controller._handle_play(False)
+        controller._handle_play_stream_end("播放流结束")
+        self.assertTrue(controller._awaiting_new_stream)
+        controller.append(b"\x00" * 4096)
+        self.assertFalse(controller._awaiting_new_stream,
+                         "仍有 PCM 时必须取消 pend 过渡（该兜底此前从未执行）")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

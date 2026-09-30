@@ -304,7 +304,10 @@ class Bridge:
         assert self._ring and self._streams and self._registry and self._controller
 
         # 音频读取线程
-        self._audio_reader = AudioPipeReader(self.audio_fifo, self._ring)
+        # 音频必须经 controller → VirtualPlayer，而不是直接写 ring：
+        # VirtualPlayer.on_audio_bytes 还承载「暂停中持续收到 PCM ⇒ 已恢复」
+        # 与「仍在推送 PCM ⇒ pend 不算流结束」两条兜底。
+        self._audio_reader = AudioPipeReader(self.audio_fifo, self._controller)
         self._audio_reader.start()
 
         # 元数据读取线程

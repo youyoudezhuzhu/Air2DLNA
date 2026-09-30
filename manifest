@@ -1,5 +1,5 @@
 appname                    = air2dlna
-version                    = 1.0.27
+version                    = 1.0.28
 display_name               = Air2DLNA
 desc                       = Air2DLNA：把任意 DLNA/UPnP 音响变成 AirPlay 2 音箱。应用原生运行在飞牛 NAS 上（不使用 Docker），内置 AirPlay 2 接收器，把 Apple 设备推来的音频实时转成 PCM 流经 HTTP 推送到局域网 DLNA MediaRenderer，并提供 Web UI 管理 AirPlay 名称、DLNA 设备选择、播放状态与日志。
 platform                   = x86
@@ -16,4 +16,4 @@ service_port               = 8788
 checkport                  = true
 ctl_stop                   = true
 disable_authorization_path = true
-changelog                  = 1.0.27 **SEEK 实验版**（单变量 A/B）：按外部分析结论，把「seek 后彻底无声」的头号嫌疑做成可验证实验 —— **seek 时保持 DLNA 会话与 HTTP 连接，不再 Stop / 不再换 URI / 不再 SetAVTransportURI**。真机证据：① seek 实测**从不发 pfls/pdis**（计数为 0），它表现为「暂停 → 恢复且曲目位置跳变」，命中的是 _handle_play 的 resume-rebuild 分支；② 该分支旧行为会换代 + 新 URI + SetAVTransportURI，**主动拆掉渲染器正在使用的 HTTP 连接**，而 AirPlay 此刻要 10~20 秒才重新送出 PCM，于是渲染器建好即空转、随后自行 STOPPED（日志：「真实 PCM 恢复」之后紧接着「渲染器=STOPPED 拉流连接=0」）。现在改为：只 flush 旧 PCM（新 generation），保持会话与 URI，渲染器**现有的** HTTP 连接自动跟随新 generation，空窗由连续输出的静音填充，PCM 到达后无缝继续（保持窗口 30 秒；窗口内静音超时不再触发 RECOVERING/换代）。新增 **T0~T9 打点**（seek 检测/是否发 Stop/是否 SetURI/渲染器 GET/首个静音字节/首个真实 PCM/HTTP 断开/渲染器 STOPPED/窗口结束），并在结束时输出报告，其中显式给出 **T6→T7（我们先断）** 与 **T6→T8（渲染器先停）** 两个间隔 —— 用于判定 PCM 恢复后到底是渲染器主动结束会话（设备兼容性）还是我们先关了连接（本方 bug）。新增配置项 `seek_keep_session`（默认 true）：设为 false 可一键回到旧行为做对照。同时 stream 层修正：跟随新 generation 时重置本连接字节预算（同一 HTTP 连接跨代输出时，旧实现会按旧代长度提前结束）。单元测试 192/192 通过（含实验开关两侧的用例）。<br/>
+changelog                  = 1.0.28 两个重要结果。① **发现并修复一处接线 bug（很可能是「拖进度条后无声」的真正元凶之一）**：bridge.py 把 AudioPipeReader 的 sink 直接绑成了裸 ring（AudioPipeReader(self.audio_fifo, self._ring)），而 VirtualPlayer.on_audio_bytes **在整个代码库里只有定义、没有任何生产调用点**（只有测试调用过）——同处的元数据读取器却是正确绑到 controller 的，足以说明这是遗漏。它导致两条兜底在生产环境**从未执行**：(a) 暂停期间持续收到 PCM ⇒ 判定 AirPlay 其实已恢复（真机实测拖动进度条时 AirPlay 可能**完全不发** pbeg/pres/pfls 任何事件，只靠事件永远醒不过来）；(b) 仍在推送 PCM ⇒ 不把 pend 当成播放流真正结束。现改为 AudioPipeReader(self.audio_fifo, self._controller)，并给 VirtualPlayer/BridgeController 补齐 append()/byte_rate（读取器的 sink 协议）。② **SEEK 实验（1.0.27）已得到明确结论**：保持会话期间渲染器**从未转入 STOPPED**，全程 renderer=PLAYING、拉流连接=1，位置 rel_time 从 12s 正常推进到 23s ——证实「seek 时主动 Stop/重建」确实是问题，且保持会话的方向正确（此前每次都会 STOPPED）。但仍有听不到声音的情况，因此新增决定性诊断：在诊断行输出 **real_pcm / silence 秒数对比**（分别统计真实 PCM 字节与静音填充字节），直接回答「音箱一直在拉流时我们喂的到底是音频还是静音」。另修正 SEEK 打点的 T6（此前因上述接线 bug 永远打不上）。单元测试 196/196 通过（新增 4 项 AudioIngestWiringTests，专门锁定音频必须经 VirtualPlayer 进入环形缓冲）。<br/>

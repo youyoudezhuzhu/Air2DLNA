@@ -175,6 +175,31 @@ class BridgeController:
             pass
         self._player.stop()
 
+    # --------------------------------------------------------------- 音频入口
+    def on_audio_bytes(self, data: bytes) -> None:
+        """音频读取线程入口（转发给 VirtualPlayer）。
+
+        **必须经 VirtualPlayer，不能直接写 ring**：``VirtualPlayer.on_audio_bytes``
+        额外承载两条兜底，且都已由测试覆盖：
+
+        * 暂停期间持续收到 PCM ⇒ 判定 AirPlay 其实已恢复（真机实测拖动进度条时
+          AirPlay 可能**完全不发** pbeg/pres/pfls 任何事件，只靠事件永远醒不过来）；
+        * 仍在推送 PCM ⇒ 不把 ``pend`` 当成播放流真正结束。
+
+        bridge.py 原先把 ``AudioPipeReader`` 的 sink 直接绑成 ring（而同处的
+        元数据读取器却正确绑到了 controller），导致上面两条**在生产环境从未执行**，
+        只有测试调用过 —— 这正是「拖进度条后无声」一直修不好的原因之一。
+        """
+        self._player.on_audio_bytes(data)
+
+    def append(self, data: bytes) -> None:
+        """兼容 ``AudioPipeReader`` 的 sink 协议。"""
+        self._player.on_audio_bytes(data)
+
+    @property
+    def byte_rate(self) -> int:
+        return self._player.byte_rate
+
     # ------------------------------------------------------------ Renderer Profile
     def _profile_for(self, record=None) -> RendererProfile:
         """按渲染器身份选择 Profile（配置项 ``renderer_profile`` 可强制覆盖）。"""

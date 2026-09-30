@@ -5,6 +5,65 @@
 
 ---
 
+## 1.0.28 — 找到音频接线 bug；SEEK 实验得出结论
+
+### 结果一：发现一处真实的接线 bug（很可能是长期修不好的元凶之一）
+`bridge.py` 把音频读取器的 sink 绑成了**裸环形缓冲**：
+
+```python
+self._audio_reader = AudioPipeReader(self.audio_fifo, self._ring)   # ← 旧
+```
+
+于是 `VirtualPlayer.on_audio_bytes()` —— 在整个代码库里**只有定义、没有任何生产调用点**
+（只有测试调用过）—— 是**死代码**。对照：同一处的元数据读取器是**正确**绑到 controller 的：
+
+```python
+self._metadata_reader = MetadataPipeReader(
+    self.metadata_fifo, self._controller.on_metadata_item)          # ← 正确的写法
+```
+
+**两条兜底因此在生产环境从未执行过：**
+
+1. **暂停期间持续收到 PCM ⇒ 判定 AirPlay 其实已恢复。** 这条是 1.0.18 专门为
+   「拖动进度条时 AirPlay 完全不发任何事件（既无 pfls/pdis 也无 pres/pbeg），
+   只有 PCM 从新位置继续送来」而加的 —— **恰好就是 seek 场景**。
+2. **仍在推送 PCM ⇒ 不把 `pend` 当成播放流真正结束。**
+
+修复：`AudioPipeReader(self.audio_fifo, self._controller)`，并为
+`VirtualPlayer` / `BridgeController` 补齐 `append()` 与 `byte_rate`
+（读取器使用的 sink 协议）。
+
+### 结果二：SEEK 实验（1.0.27）得到了明确结论
+保持会话期间，渲染器**从未转入 STOPPED**：
+
+```
+22:02:09  诊断: state=PLAYING machine=PLAYING renderer=PLAYING rel_time=12000 http_clients=1
+22:02:26  诊断: state=PLAYING machine=PLAYING renderer=PLAYING rel_time=23000 http_clients=1
+```
+
+`renderer=PLAYING`、`拉流连接=1`、`rel_time` 从 12s 正常推进到 23s。
+**对比旧行为（每次 seek 都会 `渲染器=STOPPED 拉流连接=0`）**，
+这证实了两件事：① 「seek 时主动 Stop / 重建会话」确实是个真问题；
+② 「保持会话」的方向是正确的。
+
+### 新增决定性诊断：real_pcm / silence 秒数
+既然渲染器在拉流、我们也在推数据，但用户仍听不到声音，就必须回答
+**「我们喂给它的到底是音频还是静音」**。诊断行新增：
+
+```
+real_pcm=12.3s silence=45.1s
+```
+
+分别统计真实 AirPlay PCM 字节与静音填充字节。若 `silence` 远大于 `real_pcm`，
+说明问题在 AirPlay 侧没有送来 PCM，而不是 DLNA 侧的处理。
+
+### 验证
+单元测试 **196/196** 通过，新增 4 项 `AudioIngestWiringTests` 专门锁定
+「音频必须经 VirtualPlayer 进入环形缓冲」这条接线，
+并验证两条兜底确实可达。
+
+---
+
 ## 1.0.27 — SEEK 实验版：seek 时保持 DLNA 会话（单变量 A/B）
 
 按外部分析（ChatGPT）结论，把「seek 后彻底无声」的**头号嫌疑**做成可验证的最小实验。

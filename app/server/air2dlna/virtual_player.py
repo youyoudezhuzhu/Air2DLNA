@@ -660,6 +660,19 @@ class VirtualPlayer:
             # 仍有 PCM 进来 → 播放流并未真正结束（只是事件次序），立刻退出过渡态
             self._cancel_transition("仍在推送 PCM")
 
+    # ------------------------------------------------- AudioPipeReader 的 sink 协议
+    def append(self, data: bytes) -> None:
+        """兼容音频读取器的 sink 协议（它调用 ``sink.append(chunk)``）。
+
+        bridge.py 必须把读取器的 sink 绑到 VirtualPlayer，而不是裸的 ring ——
+        见 :meth:`on_audio_bytes` 里那两条兜底逻辑的说明。
+        """
+        self.on_audio_bytes(data)
+
+    @property
+    def byte_rate(self) -> int:
+        return self.ring.byte_rate
+
     # --------------------------------------------------------------- 元数据入口
     def on_metadata_item(self, item: MetadataItem) -> None:
         """元数据读取线程回调。**不得阻塞**，所有网络动作交给收敛线程。"""
@@ -1939,7 +1952,8 @@ class VirtualPlayer:
         log.info(
             "诊断: airplay_pos=%s state=%s machine=%s renderer=%s rel_time=%s offset=%s rate=%s "
             "gen=%s token=%s http_clients=%s bytes_served=%s last_range=%s "
-            "idle=%.1fs uri_count=%d last_rebuild=%s awaiting_new_stream=%s pause_recovery=%s "
+            "real_pcm=%.1fs silence=%.1fs idle=%.1fs uri_count=%d last_rebuild=%s "
+            "awaiting_new_stream=%s pause_recovery=%s "
             "keepalive_capable=%s tl_playing=%s pending=%s",
             int(self.timeline.position_ms()) if self.timeline.position_ms() is not None else "-",
             state_name, machine, renderer_state,
@@ -1950,6 +1964,12 @@ class VirtualPlayer:
             session.clients if session is not None else 0,
             int(session.bytes_served) if session is not None else 0,
             self._last_range_info or "-",
+            # 真实 PCM 与静音的**秒数对比** —— 判定「音箱在拉流但听不到声音」时，
+            # 这两个数字直接回答「我们喂的是音频还是静音」。
+            (getattr(session, "pcm_bytes", 0) / float(self.ring.byte_rate)
+             if session is not None else 0.0),
+            (getattr(session, "silence_bytes", 0) / float(self.ring.byte_rate)
+             if session is not None else 0.0),
             (now - session.last_activity) if session is not None and session.last_activity else -1.0,
             self.output.uri_count, self._last_rebuild_reason or "-", self._awaiting_new_stream,
             ("active" if self._pause_recovery_deadline > 0.0
