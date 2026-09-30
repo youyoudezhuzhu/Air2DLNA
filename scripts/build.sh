@@ -277,7 +277,15 @@ pack() {
     chmod -R a+rX "$ROOT/app" "$ROOT/cmd" "$ROOT/config" "$ROOT/wizard" 2>/dev/null || true
 
     command -v fnpack >/dev/null || die "未找到 fnpack（飞牛官方打包工具）"
-    ( cd "$WORK" && rm -f ./*.fpk && fnpack build --directory "$ROOT" >/dev/null )
+    # 注意：fnpack **打包失败时仍然返回退出码 0**，只信退出码会得到「静默无产物」，
+    # 随后 mv 报一个与真正原因无关的错误。因此必须解析输出判断成败。
+    local pack_log="$WORK/fnpack.log"
+    ( cd "$WORK" && rm -f ./*.fpk && fnpack build --directory "$ROOT" ) > "$pack_log" 2>&1 || true
+    if ! grep -q "Packing successfully" "$pack_log"; then
+        echo "--- fnpack 输出 ---" >&2
+        cat "$pack_log" >&2
+        die "fnpack 打包失败（常见原因：manifest 的 version 不符合 x.y.z[-r] 且各段为整数，例如 1.0.22-1）"
+    fi
 
     local out="$DIST/Air2DLNA-$VERSION.fpk"
     mkdir -p "$DIST"
