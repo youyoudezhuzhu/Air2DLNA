@@ -321,6 +321,12 @@ class Handler(BaseHTTPRequestHandler):
             "timeline": base["timeline"],
             "buffer": base["buffer"],
             "volume": session,
+            # Virtual Player 架构的可见性（1.0.23）：真实状态机 / 请求状态、
+            # Renderer Profile 与反向控制能力（逐项 SUPPORTED/UNSUPPORTED/UNKNOWN）。
+            "virtual_player": base.get("virtual_player"),
+            "renderer_profile": base.get("renderer_profile"),
+            "reverse_control": base.get("reverse_control"),
+            "diagnostics": base.get("diagnostics"),
         }
 
     def _trigger_discovery(self) -> None:

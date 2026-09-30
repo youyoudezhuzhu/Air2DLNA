@@ -346,6 +346,17 @@ def main() -> int:
               str(set_volume["args"]) if set_volume else "无")
         check(status["renderer"] is not None and status["renderer"]["online"] is True,
               "渲染器在线状态正确")
+        check((status.get("virtual_player") or {}).get("machine_state") in ("PLAYING", "BUFFERING"),
+              "Virtual Player 真实状态机已通过 /api/status 暴露",
+              str(status.get("virtual_player")))
+        check(isinstance(status.get("renderer_profile"), dict)
+              and status["renderer_profile"].get("name") == "generic",
+              "Renderer Profile 按设备身份选择（fake renderer → generic）",
+              str((status.get("renderer_profile") or {}).get("name")))
+        check(isinstance(status.get("reverse_control"), dict)
+              and "capabilities" in status["reverse_control"],
+              "反向控制能力状态已通过 /api/status 暴露（无凭据时为 UNKNOWN）",
+              str((status.get("reverse_control") or {}).get("capabilities")))
 
         # ------------------------------------------------------------- 6. 暂停
         before_pause = len(all_of(http_json(f"http://127.0.0.1:{fake_info['http_port']}/__record"), "Pause"))
@@ -386,14 +397,26 @@ def main() -> int:
         # ------------------------------------------------------------- 9. 结束
         before_stop = len(all_of(rec, "Stop"))
         meta.ssnc("pend")
+        # 1.0.21 起的语义（本用例原先在此处误判为「立即 Stop」）：
+        # ``pend`` 只是「AirPlay 播放流结束」，不等价于会话结束 —— 真机上拖动
+        # 进度条、切歌、暂停都可能只发 pend，因此状态机会进入 12 秒过渡窗口并
+        # **保持** DLNA 会话不变。真正的播放结束由 ``aend``（退出活动模式）确认。
+        time.sleep(0.5)
+        mid = http_json(f"{base}/api/status")
+        check(mid["playback"]["state"] != "STOPPED",
+              "结束：pend 进入过渡态（不立即置为 STOPPED，保留 DLNA 会话）",
+              mid["playback"]["state"])
+        meta.ssnc("aend")
         wait_for(lambda: len(all_of(http_json(
-            f"http://127.0.0.1:{fake_info['http_port']}/__record"), "Stop")) > before_stop, 10)
+            f"http://127.0.0.1:{fake_info['http_port']}/__record"), "Stop")) > before_stop, 15)
         rec = http_json(f"http://127.0.0.1:{fake_info['http_port']}/__record")
         check(len(all_of(rec, "Stop")) > before_stop, "结束：渲染器收到 Stop")
-        status = http_json(f"{base}/api/status")
-        check(status["playback"]["state"] == "STOPPED", "结束：内部状态 = STOPPED",
-              status["playback"]["state"])
-        check(status["playback"]["title"] == "", "结束：元数据已清空")
+        status = wait_for(lambda: (lambda s: s if s["playback"]["state"] == "STOPPED" else None)(
+            http_json(f"{base}/api/status")), 8)
+        check(bool(status) and status["playback"]["state"] == "STOPPED",
+              "结束：内部状态 = STOPPED",
+              status["playback"]["state"] if status else "未知")
+        check(bool(status) and status["playback"]["title"] == "", "结束：元数据已清空")
 
         # ------------------------------------------- 10. SOAP 头/体一致性校验
         mismatched = [e for e in rec["events"]

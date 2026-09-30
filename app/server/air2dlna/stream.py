@@ -1,5 +1,9 @@
 """实时 PCM/WAV HTTP 流：DLNA 渲染器从这里拉取音频。
 
+在 Virtual Player 架构（ARCHITECTURE_V2 第 24 节）里，本模块的角色是
+**Virtual Media Output**：它对外表现为一个连续、稳定的媒体资源，内部可能来自
+真实 AirPlay PCM，也可能来自输出层生成的静音。
+
 对应 TECHNICAL_DESIGN 第 5、6 节。已按 AirConnect 1.12.4 的实战经验调整：
 
 * 每一代流使用**唯一的路径**（``/stream/<token>.wav``）而不是查询串，
@@ -12,6 +16,9 @@
 * 对 ``Range`` 请求：``start == 0`` 时按「从当前位置完整重发」返回 200
   （即向渲染器声明不支持字节范围，这是 AirConnect 的成熟做法）；
   ``start > 0`` 且数据仍在缓冲中时返回 206 + ``Content-Range``。
+* **连续输出**（``session.continuous_output``）：DLNA 仍在播放时，暂时没有真实
+  AirPlay PCM 就用静音填充并保持响应，绝不 EOF；静音只在输出层生成，绝不写回
+  AirPlay 环形缓冲（第 6/7 节）。
 """
 
 from __future__ import annotations
@@ -177,6 +184,23 @@ class StreamSession:
     #: **静音只在输出层生成，绝不写入环形缓冲** —— 环形缓冲承载的是 AirPlay 真实
     #: 时间线，不能被合成音频污染（否则位置/seek/时间线全部失真）。
     silence_mode: bool = False
+    #: 连续输出语义（ARCHITECTURE_V2 第 6 节）：为真时，只要 DLNA 还在播放，
+    #: 暂时没有真实 AirPlay PCM 就用静音填充，**绝不 EOF / 断开响应**。
+    #: 默认 False：只有 DLNA Output 层为「正在播放」的媒体会话打开它，
+    #: 其它调用方（含单元测试）保持旧的 idle_timeout 断开语义。
+    continuous_output: bool = False
+    #: 连续输出的静音上限（秒）。累计静音超过该值后回调 ``on_silence_timeout``
+    #: （由 Virtual Player 转入 RECOVERING），但连接本身**不会**被主动断开。
+    #: 0 表示不触发（仅用于测试或明确要求无限静音的场景）。
+    silence_timeout_s: float = 0.0
+    #: 静音超时回调：只在输出线程里被调用一次，用于通知控制层「长时间没有
+    #: 真实 PCM」。回调必须立即返回（不得做网络/阻塞操作）。
+    on_silence_timeout: Optional[Callable[[], None]] = None
+    #: 已经通过连续输出发送的静音字节（诊断用；与 ``bytes_served`` 分开统计）。
+    silence_bytes: int = 0
+    #: 连续输出下等待真实 PCM 的单次读取超时（秒）。越小，真实 PCM 断流后
+    #: 越快地切换为静音（暂停/seek/切歌后的空窗因此不会变成 EOF）。
+    read_timeout_s: float = 0.2
 
     @property
     def byte_rate(self) -> int:
@@ -362,7 +386,13 @@ class StreamManager:
             # 若渲染器中途重连并请求从 0 开始，从本代起点重新发送（实时流语义）
             chunk_size = 32 * 1024
             last_progress = time.monotonic()
-            while not session.closed:
+            #: 连续输出下「真实 PCM 空窗」的起点；None 表示当前有真实 PCM
+            silence_since: Optional[float] = None
+            silence_notified = False
+            read_timeout = (session.read_timeout_s if session.continuous_output else 1.0)
+            while True:
+                if session.closed:
+                    break
                 # 暂停 keepalive：输出层生成静音（不读环形缓冲、不污染 AirPlay 时间线）。
                 # 渲染器因此一直有数据可拉、保持 PLAYING，恢复时无需任何 UPnP 操作。
                 if session.silence_mode:
@@ -377,7 +407,9 @@ class StreamManager:
                         break
                     sent_conn += len(silence)
                     session.bytes_served += len(silence)
+                    session.silence_bytes += len(silence)
                     session.last_activity = time.monotonic()
+                    silence_since = None
                     if session.on_bytes is not None:
                         try:
                             session.on_bytes(session.bytes_served)
@@ -389,7 +421,8 @@ class StreamManager:
                 if session.total_bytes is not None and sent_conn >= session.total_bytes:
                     break
                 try:
-                    data, offset = self.ring.read(offset, session.generation, chunk_size, 1.0)
+                    data, offset = self.ring.read(offset, session.generation, chunk_size,
+                                                  read_timeout)
                 except StaleGeneration:
                     log.info("流已换届，主动断开旧连接: token=%s", session.token)
                     break
@@ -397,12 +430,62 @@ class StreamManager:
                     log.warning("渲染器消费过慢，缓冲区被覆盖，断开连接: token=%s", session.token)
                     break
                 if not data:
+                    if session.continuous_output:
+                        # 连续媒体输出（ARCHITECTURE_V2 第 6/7 节）：DLNA 仍在播放，
+                        # 但暂时没有真实 AirPlay PCM（恢复/seek/切歌的空窗）→ 用静音
+                        # 填充真实时间轴，**绝不主动 EOF/断开**。静音只在输出层生成，
+                        # 绝不会写入 AirPlay 环形缓冲或时间线。
+                        now = time.monotonic()
+                        if silence_since is None:
+                            silence_since = now
+                            silence_notified = False
+                            log.info("连续输出：真实 PCM 暂时不足，切换为静音填充"
+                                     "（token=%s gen=%d）", session.token, session.generation)
+                        silence = b"\x00" * chunk_size
+                        wfile.write(silence)
+                        try:
+                            wfile.flush()
+                        except Exception:  # noqa: BLE001
+                            break
+                        sent_conn += len(silence)
+                        session.bytes_served += len(silence)
+                        session.silence_bytes += len(silence)
+                        session.last_activity = now
+                        if session.on_bytes is not None:
+                            try:
+                                session.on_bytes(session.bytes_served)
+                            except Exception:  # noqa: BLE001
+                                pass
+                        # 静音超时：只通知控制层进入 RECOVERING，不在此处做任何网络/
+                        # 状态操作，也**不**断开响应（第 8 节）。
+                        if (not silence_notified
+                                and session.silence_timeout_s > 0
+                                and now - silence_since >= session.silence_timeout_s):
+                            silence_notified = True
+                            log.warning(
+                                "连续输出：真实 PCM 已中断 %.1fs（阈值 %.1fs），"
+                                "通知控制层进入恢复流程（不断开 HTTP）: token=%s",
+                                now - silence_since, session.silence_timeout_s,
+                                session.token)
+                            if session.on_silence_timeout is not None:
+                                try:
+                                    session.on_silence_timeout()
+                                except Exception:  # noqa: BLE001
+                                    log.exception("静音超时回调异常")
+                        time.sleep(chunk_size / float(session.byte_rate or 176400))
+                        continue
                     if time.monotonic() - last_progress > idle_timeout:
                         log.warning("音频流超时（%.0fs 无数据），断开连接: token=%s",
                                     idle_timeout, session.token)
                         break
                     continue
                 last_progress = time.monotonic()
+                if silence_since is not None:
+                    log.info("连续输出：真实 PCM 恢复，结束静音填充（空窗 %.1fs，"
+                             "token=%s gen=%d）", last_progress - silence_since,
+                             session.token, session.generation)
+                    silence_since = None
+                    silence_notified = False
                 if session.total_bytes is not None:
                     remaining = session.total_bytes - sent_conn
                     if len(data) > remaining:

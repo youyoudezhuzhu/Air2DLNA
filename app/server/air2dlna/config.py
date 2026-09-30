@@ -62,6 +62,23 @@ DEFAULTS: dict[str, Any] = {
     # 采样率/声道（固定 44.1k/2ch，见 TECHNICAL_DESIGN 第 5 节）
     "sample_rate": 44100,
     "channels": 2,
+    # ------------------------------------------------------------------ Virtual Player
+    # Renderer Profile 覆盖："" = 按设备身份自动选择（generic 兜底）；
+    # 也可以强制为 "generic" / "xiaomi_s12"（见 air2dlna/renderer_profile.py）。
+    "renderer_profile": "",
+    # 输出缓冲水位（毫秒，ARCHITECTURE_V2 第 9 节）。target≈1000ms，
+    # 不强制精确 1 秒；minimum/maximum 用于吸收 AirPlay → DLNA 的抖动。
+    "minimum_buffer_ms": 400,
+    "target_buffer_ms": 1000,
+    "maximum_buffer_ms": 1800,
+    # 连续 HTTP 媒体输出（第 6 节）：DLNA 播放期间真实 PCM 不足时用静音填充，不 EOF。
+    "continuous_output": True,
+    # 连续输出下真实 PCM 中断多久后进入 RECOVERING（秒，第 8 节）
+    "silence_timeout_seconds": 8,
+    # 反向控制（DACP）网络超时（秒，第 20 节）；每项能力仍独立检测
+    "dacp_timeout_seconds": 2.0,
+    # 反向控制总开关：即使发送端提供凭据，也可以显式关闭
+    "reverse_control_enabled": True,
 }
 
 # 允许通过 REST API 修改的键（白名单，避免注入任意字段）
@@ -83,6 +100,14 @@ EDITABLE_KEYS = {
     "pause_keepalive_timeout_seconds",
     "metadata_poll_seconds",
     "rediscover_seconds",
+    "renderer_profile",
+    "minimum_buffer_ms",
+    "target_buffer_ms",
+    "maximum_buffer_ms",
+    "continuous_output",
+    "silence_timeout_seconds",
+    "dacp_timeout_seconds",
+    "reverse_control_enabled",
 }
 
 LOG_LEVELS = ("debug", "info", "warn", "error")
@@ -216,6 +241,44 @@ def validate_value(key: str, value: Any) -> Any:
         if not (0 <= ms <= 5000):
             raise ConfigError("resume_prebuffer_ms 必须在 0-5000 毫秒之间")
         return ms
+    if key == "renderer_profile":
+        from .renderer_profile import PROFILES
+
+        text = str(value).strip()
+        if text and text not in PROFILES:
+            raise ConfigError(
+                "renderer_profile 只能是空（自动识别）或 " + " / ".join(sorted(PROFILES)))
+        return text
+    if key in ("minimum_buffer_ms", "target_buffer_ms", "maximum_buffer_ms"):
+        try:
+            ms = int(value)
+        except (TypeError, ValueError):
+            raise ConfigError(f"{key} 必须是整数") from None
+        if key == "minimum_buffer_ms" and not (0 <= ms <= 9000):
+            raise ConfigError("minimum_buffer_ms 必须在 0-9000 之间")
+        if key == "target_buffer_ms" and not (0 <= ms <= 20000):
+            raise ConfigError("target_buffer_ms 必须在 0-20000 之间")
+        if key == "maximum_buffer_ms" and not (0 <= ms <= 60000):
+            raise ConfigError("maximum_buffer_ms 必须在 0-60000 之间")
+        return ms
+    if key in ("continuous_output", "reverse_control_enabled"):
+        return _as_bool(value)
+    if key == "silence_timeout_seconds":
+        try:
+            sec = float(value)
+        except (TypeError, ValueError):
+            raise ConfigError("silence_timeout_seconds 必须是数字") from None
+        if not (0 <= sec <= 600):
+            raise ConfigError("silence_timeout_seconds 必须在 0-600 秒之间")
+        return round(sec, 1)
+    if key == "dacp_timeout_seconds":
+        try:
+            sec = float(value)
+        except (TypeError, ValueError):
+            raise ConfigError("dacp_timeout_seconds 必须是数字") from None
+        if not (0.2 <= sec <= 30):
+            raise ConfigError("dacp_timeout_seconds 必须在 0.2-30 秒之间")
+        return round(sec, 1)
     raise ConfigError(f"未知配置项: {key}")
 
 

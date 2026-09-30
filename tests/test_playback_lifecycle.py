@@ -733,15 +733,21 @@ class ResumeTimelineTests(unittest.TestCase):
         self.assertTrue(controller._resume_timeline.reported)
         self.assertIn("T14_playing_confirmed", controller._resume_timeline.marks)
 
-    def test_prebuffer_fills_silence_when_configured(self) -> None:
+    def test_prebuffer_silence_stays_in_output_layer(self) -> None:
+        """**行为变更（1.0.23 / ARCHITECTURE_V2 第 23、28 节）**。
+
+        旧实现会在换代时把 ``resume_prebuffer_ms`` 毫秒的静音写进 AirPlay 环形缓冲；
+        新规格明确禁止：「Silence 只存在于 DLNA Output 层，不得污染 AirPlay
+        RingBuffer 和 Timeline」。因此该配置项现在只影响 DLNA 输出层（连续输出），
+        环形缓冲必须保持干净 —— 本测试锁定这一点（原断言要求写入静音，已按规格更新）。
+        """
         controller, config, ring, _, _, _ = _build()
         config["resume_prebuffer_ms"] = 500
         controller._handle_play(False)
         controller._begin_new_generation("prebuffer-test", None)
 
-        served = ring.write_offset
-        self.assertGreaterEqual(served, int(176400 * 0.5), "应写入约 500ms 的静音")
-        self.assertLessEqual(served, int(176400 * 0.6))
+        self.assertEqual(0, ring.write_offset,
+                         "不得把合成静音写入 AirPlay 环形缓冲（第 23/28 节）")
 
     def test_prebuffer_off_by_default(self) -> None:
         controller, _, ring, _, _, _ = _build()
